@@ -1,5 +1,3 @@
-// --- drop-in replacements for: create_weights, create_sigma_point_matrix, compute_transistion_function
-
 #include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
