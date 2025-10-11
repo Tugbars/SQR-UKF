@@ -12,6 +12,14 @@
 #  define SQR_UKF_ENABLE_BATCH8 0
 #endif
 
+static inline void* ukf_aligned_alloc(size_t nbytes) {
+    return linalg_aligned_alloc(32, nbytes);
+}
+
+static inline void ukf_aligned_free(void* p) {
+    linalg_aligned_free(p);
+}
+
 /**
  * @brief Compute Unscented weights for mean (Wm) and covariance (Wc).
  *
@@ -179,8 +187,8 @@ static void compute_transistion_function(float Xstar[], const float X[], const f
 #if SQR_UKF_ENABLE_BATCH8
     if (ukf_has_avx2() && N >= 8) {
         /* SoA buffers: 8 states contiguous each */
-        float *x = (float*)aligned_alloc(32, (size_t)8 * L * sizeof(float));
-        float *d = (float*)aligned_alloc(32, (size_t)8 * L * sizeof(float));
+        float *x = (float*)ukf_aligned_alloc((size_t)8 * L * sizeof(float));
+        float *d = (float*)ukf_aligned_alloc((size_t)8 * L * sizeof(float));
         if (!x || !d) { free(x); free(d); /* fall through to scalar */ }
         else {
             uint8_t j = 0;
@@ -368,7 +376,14 @@ static void create_state_estimation_error_covariance_matrix(float S[], float W[]
     }
 
     /* A' is required by the SR-UKF derivation */
-    tran(AT, AT, L, M);   /* (L x M) -> (M x L) in-place via workspace inside tran */
+    {
+    const size_t nbytes = (size_t)L * M * sizeof(float);
+    float *ATtmp = (float*)ukf_aligned_alloc(nbytes);
+    if (!ATtmp) { /* fallback if you want */ return; }
+    tran(ATtmp, AT, L, M);
+    memcpy(AT, ATtmp, nbytes);
+    ukf_aligned_free(ATtmp);
+    }
 
     /* QR of A' (M x L). We only need R_ (upper triangular M x L) */
     float Qtmp[(size_t)M * M];   /* not used but qr() wants it */
@@ -740,31 +755,6 @@ static void update_state_covarariance_matrix_and_state_estimation_vector(float S
             cholupdate(S, Uk, n, false);
         }
     }
-}
-
-static inline void* ukf_aligned_alloc(size_t nbytes) {
-#if defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
-    return aligned_alloc(32, ((nbytes + 31) / 32) * 32);
-#elif defined(_MSC_VER)
-    return _aligned_malloc(nbytes, 32);
-#else
-    // fallback: overallocate and align manually
-    void* base = malloc(nbytes + 64);
-    if (!base) return NULL;
-    uintptr_t p = ((uintptr_t)base + 31 + sizeof(void*)) & ~((uintptr_t)31);
-    ((void**)p)[-1] = base;
-    return (void*)p;
-#endif
-}
-
-static inline void ukf_aligned_free(void* p) {
-#if defined(_MSC_VER)
-    _aligned_free(p);
-#elif defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
-    free(p);
-#else
-    if (p) free(((void**)p)[-1]);
-#endif
 }
 
 /**

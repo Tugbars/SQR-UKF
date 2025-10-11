@@ -60,7 +60,7 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
     }
 
     if (!only_R) {
-        if (inv(H, H, m) != 0) { free(H); free(W); free(WW); free(Hi); free(HiH); free(HiR); return -ENOTSUP; }
+        if (inv(Hi, H, m) != 0) { free(H); free(W); free(WW); free(Hi); free(HiH); free(HiR); return -ENOTSUP; }
         memcpy(Q, H, (size_t)m * m * sizeof(float));
     }
 
@@ -362,7 +362,7 @@ int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
 
 #if LINALG_SIMD_ENABLE
     /* workspace: v (len ≤ m) */
-    float *v = (float*)aligned_alloc(32, (size_t)m * sizeof(float));
+    float *v = (float*)linalg_aligned_alloc(32, (size_t)m * sizeof(float));
     if (!v) return -ENOMEM;
 
     const uint16_t l = (m - 1 < n) ? (m - 1) : n;
@@ -382,7 +382,7 @@ int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
             }
         }
     }
-    free(v);
+    linalg_aligned_free(v);
 #else
     /* Should not reach here thanks to the guard above */
     return qr_scalar(A, Q, R, m, n, only_R);

@@ -156,7 +156,7 @@ int mul(float *RESTRICT C,
     /* Pack B into 8-col panels */
     const size_t n_panels = (N + 7) / 8;
     const size_t Bp_elems = n_panels * K * 8;
-    float *Bp = (float*)aligned_alloc(32, Bp_elems * sizeof(float));
+    float *Bp = (float*)linalg_aligned_alloc(32, Bp_elems * sizeof(float));
     if (!Bp) return -ENOMEM;
     pack_B_8col(Bp, B, K, N);
 
@@ -217,6 +217,6 @@ int mul(float *RESTRICT C,
         }
     }
 
-    free(Bp);
+    linalg_aligned_free(Bp);
     return 0;
 }

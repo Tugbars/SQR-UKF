@@ -237,7 +237,7 @@ static int solve_block8_avx2_rowmajor(const float *RESTRICT LU,
     return -ENOTSUP; // should never be called without AVX2; caller guards this
 #else
     // n x 8 scratch block for RHS solutions
-    float *X = (float*)aligned_alloc(32, (size_t)n * 8 * sizeof(float));
+    float *X = (float*)linalg_aligned_alloc(32, (size_t)n * 8 * sizeof(float));
     if (!X) return -ENOMEM;
     memset(X, 0, (size_t)n * 8 * sizeof(float));
 
@@ -394,7 +394,7 @@ static int solve_block8_avx2_rowmajor(const float *RESTRICT LU,
             Ai_out[(size_t)r * n + (col0 + t)] = rowv[t];
     }
 
-    free(X);
+    linalg_aligned_free(X);
     return 0;
 #endif
 }

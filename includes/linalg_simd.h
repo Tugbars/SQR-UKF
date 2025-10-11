@@ -26,8 +26,22 @@ extern "C" {
 
 /* ---------- Standard includes (kept minimal for headers) ---------- */
 #include <stdint.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdalign.h>  // alignas (used later in these files)
+#include <float.h>
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__)
+#  include <malloc.h>   /* _aligned_malloc / __mingw_aligned_malloc */
+#endif
+
+static inline int ukf_has_avx2(void) {
+#if defined(__AVX2__) && defined(__FMA__)
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 /* ---------- Portability helpers ---------- */
 #ifndef RESTRICT
@@ -245,5 +259,51 @@ void cholupdate(float *RESTRICT L, const float *RESTRICT x,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+/* ---------- Portable aligned allocation (32B by default) ---------- */
+#ifndef LINALG_DEFAULT_ALIGNMENT
+#  define LINALG_DEFAULT_ALIGNMENT 32
+#endif
+
+/* Always prefer these over calling aligned_alloc/_aligned_malloc directly. */
+static inline void* linalg_aligned_alloc(size_t alignment, size_t size) {
+#if defined(_MSC_VER)
+    /* MSVC / also works in MinGW via malloc.h */
+    return _aligned_malloc(size, alignment);
+#elif defined(__MINGW32__) || defined(__MINGW64__)
+    #include <malloc.h>
+    return __mingw_aligned_malloc(size, alignment);
+#elif defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+    /* C11 aligned_alloc requires size to be a multiple of alignment */
+    size = (size + (alignment - 1)) & ~(alignment - 1);
+    return aligned_alloc(alignment, size);
+#elif defined(_POSIX_VERSION) || defined(__unix__) || defined(__APPLE__)
+    void* p = NULL;
+    if (posix_memalign(&p, alignment, size) != 0) return NULL;
+    return p;
+#else
+    /* Fallback: over-allocate and round up */
+    void* base = malloc(size + alignment + sizeof(void*));
+    if (!base) return NULL;
+    uintptr_t raw = (uintptr_t)base + sizeof(void*);
+    uintptr_t aligned = (raw + (alignment - 1)) & ~(uintptr_t)(alignment - 1);
+    ((void**)aligned)[-1] = base;
+    return (void*)aligned;
+#endif
+}
+
+static inline void linalg_aligned_free(void* p) {
+#if defined(_MSC_VER)
+    _aligned_free(p);
+#elif defined(__MINGW32__) || defined(__MINGW64__)
+    __mingw_aligned_free(p);
+#elif defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+    free(p);
+#elif defined(_POSIX_VERSION) || defined(__unix__) || defined(__APPLE__)
+    free(p);
+#else
+    if (p) free(((void**)p)[-1]);
+#endif
+}
 
 #endif /* CONTROL_LINALG_SIMD_H */

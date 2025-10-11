@@ -5,7 +5,6 @@
 #include <string.h>
 #include <immintrin.h>
 #include <stdlib.h>
-#include <stdlib.h>
 
 #include "linalg_simd.h"  // linalg_has_avx2()
 
@@ -152,7 +151,7 @@ void tran(float *RESTRICT At, const float *RESTRICT A, uint16_t row, uint16_t co
     /* in-place support: if At == A, use a temporary */
     if (At == A) {
         const size_t nbytes = R * C * sizeof(float);
-        float *tmp = (float*)aligned_alloc(32, ( (nbytes + 31) / 32) * 32);
+        float *tmp = (float*)linalg_aligned_alloc(32, nbytes);
         if (!tmp) {                  /* allocation failed: fallback scalar via two-phase */
             float *tmp2 = (float*)malloc(nbytes);
             if (!tmp2) return;       /* give up silently */
@@ -164,7 +163,7 @@ void tran(float *RESTRICT At, const float *RESTRICT A, uint16_t row, uint16_t co
         /* write into tmp, then copy back to At */
         tran(tmp, A, row, column);   /* recurse once with non-aliased dst */
         memcpy(At, tmp, nbytes);
-        free(tmp);
+        linalg_aligned_free(tmp);
         return;
     }
 
