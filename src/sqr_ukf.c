@@ -663,7 +663,7 @@ static void multiply_sigma_point_matrix_to_weights(float x[], float X[], float W
  *  Improvements over scalar:
  *   - Fewer loops and address arithmetic via wide loads/stores.
  *   - Avoids forming temporary identities; only needed blocks are built.
- *   - Uses your optimized tran(), qr(), and cholupdate().
+ *   - Uses optimized tran(), qr(), and cholupdate().
  *
  * @param[out] S   Square-root covariance [L x L], upper-triangular on output.
  * @param[in]  W   Covariance weights [N].
@@ -811,7 +811,7 @@ static void create_state_estimation_error_covariance_matrix(float S[], float W[]
     }
 
     /* -------------------- QR of A′ (M x L); only R needed -------------------- */
-    /* Ensure your qr() fully skips Q work when only_R=true and Q==NULL. */
+    /* Ensure qr() fully skips Q work when only_R=true and Q==NULL. */
     if (qr(Aprime, /*Q=*/NULL, R_, (uint16_t)M, (uint16_t)L, /*only_R=*/true) != 0)
     {
         return; /* optionally signal error */
@@ -820,7 +820,7 @@ static void create_state_estimation_error_covariance_matrix(float S[], float W[]
     /* S = upper LxL block of R_ */
     memcpy(S, R_, (size_t)L * L * sizeof(float));
 
-    /* Rank-one update/downdate with sign(W0) — matches your signature exactly */
+    /* Rank-one update/downdate with sign(W0) — matches signature exactly */
     cholupdate(/*L=*/S, /*xx=*/(const float *)b, /*n=*/(uint16_t)L, /*rank_one_update=*/(W[0] >= 0.0f));
 
     bool pd_ok = true;
@@ -1123,8 +1123,8 @@ static void create_state_cross_covariance_matrix(float *RESTRICT P, float *RESTR
  *   - No gathers: U’s columns are copied with a simple strided loop.
  *
  *  Triangle convention:
- *   - Assumes Sy is upper-triangular (standard SR-UKF). Ensure S matches your cholupdate()
- *     expectation (your cholupdate() doc says L is lower-triangular).
+ *   - Assumes Sy is upper-triangular (standard SR-UKF). Ensure S matches cholupdate()
+ *     expectation (cholupdate() doc says L is lower-triangular).
  */
 static void update_state_covarariance_matrix_and_state_estimation_vector(
     float *RESTRICT S,

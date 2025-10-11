@@ -24,7 +24,7 @@
  * fit and remain hot in L1 while we produce an 8-wide strip of outputs.
  *
  * @code
- * // Pseudocode around your AVX2 micro-kernel (1×8 or 4×8):
+ * // Pseudocode around  AVX2 micro-kernel (1×8 or 4×8):
  * for (size_t kk = 0; kk < K; kk += Kc) {
  *     const size_t Kblk = min(Kc, K - kk);
  *     for (size_t jpanel = 0; jpanel < N; jpanel += 8) {
