@@ -25,6 +25,19 @@
 #define LINALG_GEMM_PF_MIN_K 128 /* enable within-row prefetch if Kblk ≥ */
 #endif
 
+/* === Prefetch kill-switch (compile-time) ============================== */
+#ifndef LINALG_GEMM_PREFETCH_ENABLE
+#define LINALG_GEMM_PREFETCH_ENABLE 1 /* set to 0 to disable all explicit prefetch */
+#endif
+
+#if LINALG_GEMM_PREFETCH_ENABLE
+#define PREFETCH_T0(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
+#define PREFETCH_T1(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T1)
+#else
+#define PREFETCH_T0(ptr) ((void)0)
+#define PREFETCH_T1(ptr) ((void)0)
+#endif
+
 /* ===== helper: AVX2 mask for N-tail (jb < 8) ===== */
 #if LINALG_SIMD_ENABLE
 static inline __m256i avx2_tailmask(int jb)
@@ -44,13 +57,36 @@ static inline __m256i avx2_tailmask(int jb)
 
 /* ======================= Packing ======================= */
 
-/* ===== NEW: pack the whole (ib x Kblk) A tile once, in stripes of 8 rows =====
-   Layout:
-     For each 8-row stripe s (starting at i = i0 + 8*s), we store a dense Kblk×8
-     pack whose r-th row (0..7) at column k lives at:
-         Ap_off = s * (Kblk*8) + k*8 + r
-   Short stripes (final <8 rows) are zero-padded in r.
-*/
+/**
+ * @brief Pack an A tile into 8-row–striped layout for AVX2 micro-kernels.
+ *
+ * @details
+ *  Packs an (ib × Kblk) submatrix of row-major A into stripes of 8 rows.
+ *  Within each 8-row stripe `s`, elements are stored as a dense (Kblk × 8)
+ *  block with layout:
+ *
+ *      Ap_off = s*(Kblk*8) + k*8 + r
+ *                 ^stripe       ^row-lane (0..7)
+ *
+ *  where k∈[0,Kblk), r∈[0,7]. The last short stripe (ib % 8 != 0) is
+ *  zero-padded in the trailing row lanes, so kernels can always read 8 lanes.
+ *
+ *  This layout feeds the 8×8 / 4×8 / 1×8 AVX2 panels using simple
+ *  broadcasts of contiguous scalars and aligned loads from packed B.
+ *
+ * @param[out] Ap    Packed destination buffer of size n_stripes*Kblk*8 floats,
+ *                   32B-aligned. n_stripes = ceil(ib/8).
+ * @param[in]  A     Source matrix (row-major), shape (M × K).
+ * @param[in]  M     Rows of A (bounds are guaranteed by caller).
+ * @param[in]  K     Cols of A (leading dimension of row-major A).
+ * @param[in]  i0    Row offset in A for this tile (start row).
+ * @param[in]  ib    Number of tile rows to pack (tile height).
+ * @param[in]  kk    Column offset in A for this K-slab (start col).
+ * @param[in]  Kblk  Number of columns in this K-slab (tile width).
+ *
+ * @note The function assumes Ap is 32B-aligned and large enough.
+ * @warning No bounds checks; caller guarantees (i0+ib)≤M and (kk+Kblk)≤K.
+ */
 static inline void
 pack_A_block_8row_striped(float *RESTRICT Ap,
                           const float *RESTRICT A,
@@ -70,23 +106,44 @@ pack_A_block_8row_striped(float *RESTRICT Ap,
         {
             float *dst = Ap + Ap_base + k * 8;
 
-            /* fill existing rows */
+            /* fill present rows of this stripe (then pad remaining lanes with 0) */
             size_t r = 0;
             for (; r < stripe_rows; ++r)
             {
                 const size_t i = i0 + s * 8 + r;
                 dst[r] = A[i * K + (kk + k)];
             }
-            /* pad rest with zeros */
             for (; r < 8; ++r)
-                dst[r] = 0.0f;
+                dst[r] = 0.0f; /* zero-pad short stripe */
         }
     }
 }
 
-/* Pack B tile (Kblk x jb) from row-major B into contiguous 8-col panels.
- * Layout: for each 8-wide panel, row k is at panel_base + k*8.
- * Zero-pad the last panel’s short columns.
+/**
+ * @brief Pack a B tile into contiguous 8-column panels for AVX2 kernels.
+ *
+ * @details
+ *  Packs a (Kblk × jb) submatrix of row-major B into `n_panels` panels
+ *  of width 8 (last panel may be <8 and is zero-padded). Within each panel,
+ *  row k (0..Kblk-1) is stored contiguously at:
+ *
+ *      Bp_off = panel_base + k*8 + c
+ *                               ^col-lane (0..7)
+ *
+ *  This gives aligned `_mm256_load_ps` on Bp and broadcast-from-A for FMA.
+ *
+ * @param[out] Bp    Packed destination buffer, size Kblk*n_panels*8 floats,
+ *                   32B-aligned.
+ * @param[in]  B     Source matrix (row-major), shape (K × N).
+ * @param[in]  K     Rows of B (shared inner dimension).
+ * @param[in]  N     Cols of B (leading dimension of row-major B).
+ * @param[in]  kk    Row offset in B for this K-slab.
+ * @param[in]  Kblk  Number of rows in this K-slab.
+ * @param[in]  j0    Column offset in B for this N-tile.
+ * @param[in]  jb    Number of columns in this N-tile.
+ *
+ * @note Uses optional prefetch (PREFETCH_T0) guarded by LINALG_GEMM_PREFETCH_ENABLE.
+ * @warning Caller ensures Bp is aligned and large enough.
  */
 static inline void
 pack_B_8col_tile(float *RESTRICT Bp,
@@ -105,37 +162,46 @@ pack_B_8col_tile(float *RESTRICT Bp,
 
         for (size_t k = 0; k < Kblk; ++k)
         {
-            const float *src = B + (kk + k) * N + j;
+            const float *src = B + (kk + k) * N + j; /* row-major */
             float *dst = Bp + off + k * 8;
 
-            /* Prefetch next source rows in this panel */
+            /* Prefetch neighboring rows and a small intra-row lookahead */
             if (k + 1 < Kblk)
-                _mm_prefetch((const char *)(src + N), _MM_HINT_T0);
-
+                PREFETCH_T0(src + N);
             if (LINALG_GEMM_PF_ROWS_AHEAD > 0 && k + (size_t)LINALG_GEMM_PF_ROWS_AHEAD < Kblk)
-            {
-                const float *src_ra = B + (kk + k + (size_t)LINALG_GEMM_PF_ROWS_AHEAD) * N + j;
-                _mm_prefetch((const char *)src_ra, _MM_HINT_T0);
-            }
-
-            /* Small within-row lookahead when panel width is wide enough */
+                PREFETCH_T0(B + (kk + k + (size_t)LINALG_GEMM_PF_ROWS_AHEAD) * N + j);
             if (jb >= 16 && pf_elts >= 8 && w == 8)
-                _mm_prefetch((const char *)(src + pf_elts), _MM_HINT_T0);
+                PREFETCH_T0(src + pf_elts);
 
+            /* copy present cols then pad */
             size_t t = 0;
             for (; t < w; ++t)
                 dst[t] = src[t];
             for (; t < 8; ++t)
-                dst[t] = 0.0f; /* pad short panel cols */
+                dst[t] = 0.0f;
         }
-
         off += Kblk * 8;
     }
 }
 
-/* Pack A tile (ib x Kblk) from row-major A into 8-row-interleaved form.
- * For each k in Kblk, we store up to 8 row scalars contiguously:
- *    Ap[k*8 + r] = A[(i0+r), (kk+k)], r=0..ib-1; zero-pad to 8 rows.
+/**
+ * @brief Pack an A (ib × Kblk) tile into a simple 8-row interleaved form.
+ *
+ * @details
+ *  Simpler variant used by some kernels: for each k, store up to 8 row scalars
+ *  contiguously: `Ap[k*8 + r] = A[(i0+r), (kk+k)]`. Short row-blocks are padded
+ *  with zeros. This is compatible with broadcast patterns in the micro-kernels.
+ *
+ * @param[out] Ap    Packed dest buffer (Kblk*8 floats), 32B-aligned.
+ * @param[in]  A     Source (row-major), shape (M × K).
+ * @param[in]  M     Rows of A (unused; bounds guaranteed by caller).
+ * @param[in]  K     Cols of A (leading dimension).
+ * @param[in]  i0    Start row in A.
+ * @param[in]  ib    Number of rows to pack (≤8).
+ * @param[in]  kk    Start col in A.
+ * @param[in]  Kblk  Number of cols to pack.
+ *
+ * @note Used when building smaller row-block paths.
  */
 static inline void
 pack_A_8row_tile(float *RESTRICT Ap,
@@ -157,7 +223,7 @@ pack_A_8row_tile(float *RESTRICT Ap,
             if (i_pf < i0 + ib)
             {
                 const float *pfp = A + i_pf * K + (kk + k);
-                _mm_prefetch((const char *)pfp, _MM_HINT_T0);
+                PREFETCH_T0(pfp);
             }
         }
 
@@ -174,7 +240,25 @@ pack_A_8row_tile(float *RESTRICT Ap,
 
 /* ======================= Micro-kernels (AVX2/FMA) ======================= */
 
-/* ===== CHANGED: 8×8 kernel, dual-register blocking (16-step unroll) + masked tail ===== */
+/**
+ * @brief AVX2/FMA micro-kernel: accumulate C(8×jb) += Ap(…)*Bp(…), jb≤8.
+ *
+ * @details
+ *  Computes an 8-row block of C against one 8-wide B panel using a dual-tile
+ *  unroll (16 steps) to hide FMA latency. Loads Bp with aligned 256-bit loads
+ *  and broadcasts scalars from Ap. Handles jb<8 via masked loads/stores.
+ *
+ *  Accumulator mapping: acc0..acc7 correspond to the 8 C rows. Each is a YMM
+ *  holding up to 8 columns. A second set acc*b accumulates an independent tile
+ *  to increase ILP.
+ *
+ * @param[in,out] c     Pointer to C block top-left (row-major), stride ldc.
+ * @param[in]     ldc   Leading dimension of C (N of full matrix).
+ * @param[in]     Ap    Packed A stripe for these 8 rows (Kblk×8 scalars).
+ * @param[in]     Bp    Packed B panel (Kblk×8), aligned.
+ * @param[in]     Kblk  Shared inner dimension for this slab.
+ * @param[in]     jb    Active columns in this panel (1..8).
+ */
 #if LINALG_SIMD_ENABLE
 static inline void
 gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
@@ -204,17 +288,17 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
 
     /* L1/L2 prefetch for C rows touched by this kernel */
-    _mm_prefetch((const char *)(c + 0 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 1 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 2 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 3 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 4 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 5 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 6 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 7 * ldc), _MM_HINT_T0);
+    PREFETCH_T0(c + 0 * ldc);
+    PREFETCH_T0(c + 1 * ldc);
+    PREFETCH_T0(c + 2 * ldc);
+    PREFETCH_T0(c + 3 * ldc);
+    PREFETCH_T0(c + 4 * ldc);
+    PREFETCH_T0(c + 5 * ldc);
+    PREFETCH_T0(c + 6 * ldc);
+    PREFETCH_T0(c + 7 * ldc);
 
-    _mm_prefetch((const char *)(c + 0 * ldc + 2 * ldc), _MM_HINT_T1);
-    _mm_prefetch((const char *)(c + 4 * ldc + 2 * ldc), _MM_HINT_T1);
+    PREFETCH_T1(c + 0 * ldc + 2 * ldc);
+    PREFETCH_T1(c + 4 * ldc + 2 * ldc);
 
     size_t k = 0;
 
@@ -225,7 +309,7 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         {
             const size_t kpf = k + 16;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
 
 #define STEP8(BASE, AACC0, AACC1, AACC2, AACC3, AACC4, AACC5, AACC6, AACC7)          \
@@ -272,7 +356,7 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         {
             const size_t kpf = k + 8;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
 #define STEP(KOFF)                                                                       \
     do                                                                                   \
@@ -305,7 +389,7 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         {
             const size_t kpf = k + 1;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
         const __m256 b = _mm256_load_ps(Bp + k * 8);
         acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc0);
@@ -362,7 +446,21 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
 }
 #endif
 
-/* ===== CHANGED: 4×8 kernel adds masked tail + light L2 prefetch ===== */
+/**
+ * @brief AVX2/FMA micro-kernel: accumulate C(4×jb) += Ap(…)*Bp(…), jb≤8.
+ *
+ * @details
+ *  Same idea as the 8×8 kernel but for 4 rows. Uses aligned Bp loads,
+ *  broadcast-from-A, and masked tail for jb<8. Intended for handling
+ *  leftover row blocks (4..7).
+ *
+ * @param[in,out] c     Pointer to C block top-left, row-major.
+ * @param[in]     ldc   Leading dimension of C.
+ * @param[in]     Ap    Packed A rows (Kblk×8, with row offset embedded by caller).
+ * @param[in]     Bp    Packed B panel (Kblk×8).
+ * @param[in]     Kblk  Shared inner dimension.
+ * @param[in]     jb    Active columns in this panel (1..8).
+ */
 #if LINALG_SIMD_ENABLE
 static inline void
 gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
@@ -377,11 +475,11 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
 
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
 
-    _mm_prefetch((const char *)(c + 0 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 1 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 2 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 3 * ldc), _MM_HINT_T0);
-    _mm_prefetch((const char *)(c + 2 * ldc + 2 * ldc), _MM_HINT_T1);
+    PREFETCH_T0(c + 0 * ldc);
+    PREFETCH_T0(c + 1 * ldc);
+    PREFETCH_T0(c + 2 * ldc);
+    PREFETCH_T0(c + 3 * ldc);
+    PREFETCH_T1(c + 2 * ldc + 2 * ldc);
 
     size_t k = 0;
     for (; k + 7 < Kblk; k += 8)
@@ -390,7 +488,7 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         {
             const size_t kpf = k + 8;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
 #define STEP(T)                                                                       \
     do                                                                                \
@@ -417,7 +515,7 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         {
             const size_t kpf = k + 1;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
         const __m256 b = _mm256_load_ps(Bp + k * 8);
         acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc0);
@@ -452,6 +550,19 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
 }
 #endif
 
+/**
+ * @brief AVX2/FMA micro-kernel: accumulate C(1×jb) += Ap(…)*Bp(…), jb≤8.
+ *
+ * @details
+ *  Single-row kernel used for residual rows. Uses aligned loads from Bp and
+ *  scalar broadcast from Ap; handles jb<8 with mask load/store.
+ *
+ * @param[in,out] c     Pointer to C row start.
+ * @param[in]     Ap    Packed A row (Kblk×8 with lane 0 used).
+ * @param[in]     Bp    Packed B panel (Kblk×8).
+ * @param[in]     Kblk  Shared inner dimension.
+ * @param[in]     jb    Active columns (1..8).
+ */
 #if LINALG_SIMD_ENABLE
 static inline void
 gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
@@ -462,7 +573,7 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
     __m256 acc = _mm256_setzero_ps();
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
 
-    _mm_prefetch((const char *)(c + 0), _MM_HINT_T0);
+    PREFETCH_T0(c + 0);
 
     size_t k = 0;
     for (; k + 7 < Kblk; k += 8)
@@ -471,7 +582,7 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
         {
             const size_t kpf = k + 8;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
 #define STEP1(T)                                                                    \
     do                                                                              \
@@ -495,7 +606,7 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
         {
             const size_t kpf = k + 1;
             if (kpf < Kblk)
-                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+                PREFETCH_T0(Bp + kpf * 8);
         }
         const __m256 b = _mm256_load_ps(Bp + k * 8);
         acc = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc);
@@ -517,6 +628,36 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
 
 /* ======================= Top-level GEMM ======================= */
 
+/**
+ * @brief GEMM-lite: compute C = A * B (row-major), AVX2/FMA-optimized.
+ *
+ * @details
+ *  Three-level blocking (Nc/Mc/Kc) around AVX2/FMA micro-kernels. B is packed
+ *  into 8-column panels, A into 8-row stripes. Kernels:
+ *    - 8×8: main workhorse with dual-tile FMA unroll.
+ *    - 4×8, 1×8: leftover row handling (packed A stripes are zero-padded).
+ *
+ *  Scalar fallback triggers for tiny matrices or when AVX2 is unavailable.
+ *  Explicit prefetching is controlled by compile-time switch
+ *  `LINALG_GEMM_PREFETCH_ENABLE` to simplify tuning on modern CPUs.
+ *
+ * @param[out] C         (row_a × column_b), row-major.
+ * @param[in]  A         (row_a × column_a), row-major.
+ * @param[in]  B         (row_b × column_b), row-major.
+ * @param[in]  row_a     M.
+ * @param[in]  column_a  K (and row_b must equal K).
+ * @param[in]  row_b     K (must equal column_a).
+ * @param[in]  column_b  N.
+ *
+ * @retval 0          Success.
+ * @retval -EINVAL    Shape mismatch (column_a != row_b).
+ * @retval -ENOMEM    Temporary packing buffer allocation failed.
+ * @retval -ENOTSUP   (builds without AVX2 path only) unsupported.
+ *
+ * @warning C must not alias A or B. Buffers must be valid and sized.
+ * @note Tuning knobs: LINALG_BLOCK_{KC,JC,MC}, LINALG_SMALL_N_THRESH,
+ *       LINALG_GEMM_PF_* and LINALG_GEMM_PREFETCH_ENABLE.
+ */
 int mul(float *RESTRICT C,
         const float *RESTRICT A,
         const float *RESTRICT B,
@@ -572,7 +713,7 @@ int mul(float *RESTRICT C,
                 const size_t step = (size_t)(64 / sizeof(float));
                 for (size_t jpf = j0, jpf_end = j0 + jb_tile; jpf < jpf_end; jpf += step)
                 {
-                    _mm_prefetch((const char *)(B + kk_next * N + jpf), _MM_HINT_T1);
+                    PREFETCH_T1(B + kk_next * N + jpf);
                 }
             }
 
@@ -586,7 +727,7 @@ int mul(float *RESTRICT C,
                 /* L2 hints for A rows of this i-tile & current kk slab */
                 for (size_t ipf = i0, ipf_end = i0 + ib_tile; ipf < ipf_end; ipf += 8)
                 {
-                    _mm_prefetch((const char *)(A + ipf * K + kk), _MM_HINT_T1);
+                    PREFETCH_T1(A + ipf * K + kk);
                 }
 
                 /* ===== pack A ONCE for this (i0×Kblk) tile into stripes of 8 rows ===== */
@@ -616,13 +757,18 @@ int mul(float *RESTRICT C,
                     {
                         const size_t jb = (j + 8 <= j0 + jb_tile) ? 8 : (j0 + jb_tile - j);
 
+                        /* SIMD zero-init of the C block on the first K pass */
                         if (kk == 0)
                         {
+                            __m256 zero = _mm256_setzero_ps();
+                            const __m256i m = avx2_tailmask((int)jb);
                             for (size_t r = 0; r < 8; ++r)
                             {
                                 float *cr = C + (i0 + i + r) * N + j;
-                                for (size_t t = 0; t < jb; ++t)
-                                    cr[t] = 0.0f;
+                                if (jb == 8)
+                                    _mm256_storeu_ps(cr, zero);
+                                else
+                                    _mm256_maskstore_ps(cr, m, zero);
                             }
                         }
 
@@ -646,13 +792,18 @@ int mul(float *RESTRICT C,
                     {
                         const size_t jb = (j + 8 <= j0 + jb_tile) ? 8 : (j0 + jb_tile - j);
 
+                        /* SIMD zero-init of the C block on the first K pass */
                         if (kk == 0)
                         {
+                            __m256 zero = _mm256_setzero_ps();
+                            const __m256i m = avx2_tailmask((int)jb);
                             for (size_t r = 0; r < 4; ++r)
                             {
                                 float *cr = C + (i0 + i + r) * N + j;
-                                for (size_t t = 0; t < jb; ++t)
-                                    cr[t] = 0.0f;
+                                if (jb == 8)
+                                    _mm256_storeu_ps(cr, zero);
+                                else
+                                    _mm256_maskstore_ps(cr, m, zero);
                             }
                         }
 
@@ -676,11 +827,16 @@ int mul(float *RESTRICT C,
                     {
                         const size_t jb = (j + 8 <= j0 + jb_tile) ? 8 : (j0 + jb_tile - j);
 
+                        /* SIMD zero-init of the C block on the first K pass */
                         if (kk == 0)
                         {
+                            __m256 zero = _mm256_setzero_ps();
+                            const __m256i m = avx2_tailmask((int)jb);
                             float *cr = C + (i0 + i) * N + j;
-                            for (size_t t = 0; t < jb; ++t)
-                                cr[t] = 0.0f;
+                            if (jb == 8)
+                                _mm256_storeu_ps(cr, zero);
+                            else
+                                _mm256_maskstore_ps(cr, m, zero);
                         }
 
                         gemm_1x8_panel_avx2fma_add(
