@@ -11,6 +11,10 @@
 #define LINALG_BLOCK_MC 256
 #endif
 
+#ifndef LINALG_SMALL_N_THRESH
+#define LINALG_SMALL_N_THRESH 64
+#endif
+
 /* ======================= Packing ======================= */
 
 /* Pack B tile (Kblk x jb) from row-major B into contiguous 8-col panels.
@@ -33,6 +37,7 @@ pack_B_8col_tile(float *RESTRICT Bp,
         {
             const float *src = B + (kk + k) * N + j;
             float *dst = Bp + off + k * 8;
+
             size_t t = 0;
             for (; t < w; ++t)
                 dst[t] = src[t];
@@ -54,14 +59,16 @@ pack_A_8row_tile(float *RESTRICT Ap,
                  size_t i0, size_t ib,
                  size_t kk, size_t Kblk)
 {
-    (void)M; // row bound checked by caller
+    (void)M; // bounds are guaranteed by caller
     for (size_t k = 0; k < Kblk; ++k)
     {
-        const float *src_row0 = A + (kk + k);
         float *dst = Ap + k * 8;
         size_t r = 0;
         for (; r < ib; ++r)
-            dst[r] = src_row0 + (i0 + r) * K ? *(src_row0 + (i0 + r) * K - (kk + k) + (kk + k)) : A[(i0 + r) * K + (kk + k)]; // keep it simple
+        {
+            const size_t i = i0 + r;
+            dst[r] = A[i * K + (kk + k)];
+        }
         for (; r < 8; ++r)
             dst[r] = 0.0f; // pad short row block
     }
@@ -89,11 +96,10 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     size_t k = 0;
     for (; k + 7 < Kblk; k += 8)
     {
-        // Manual unroll 8
 #define STEP(KOFF)                                                                       \
     do                                                                                   \
     {                                                                                    \
-        const __m256 b = _mm256_load_ps(Bp + (k + (KOFF)) * 8); /* aligned */            \
+        const __m256 b = _mm256_load_ps(Bp + (k + (KOFF)) * 8); /* Bp is 32B-aligned */  \
         acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (k + (KOFF)) * 8 + 0), b, acc0); \
         acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (k + (KOFF)) * 8 + 1), b, acc1); \
         acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (k + (KOFF)) * 8 + 2), b, acc2); \
@@ -128,7 +134,6 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
 
     if (jb == 8)
     {
-        // Full store path
         _mm256_storeu_ps(c + 0 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 0 * ldc), acc0));
         _mm256_storeu_ps(c + 1 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 1 * ldc), acc1));
         _mm256_storeu_ps(c + 2 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 2 * ldc), acc2));
@@ -140,7 +145,6 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     }
     else
     {
-        // Tail jb < 8: spill to stack then scalar-add first jb elements
         alignas(32) float buf[8];
 #define ADD_TAIL(ROW, ACCV)             \
     do                                  \
@@ -162,7 +166,7 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     }
 }
 
-/* 4x8: leftover rows (<=4), same semantics (+= C). Ap holds up to 4 rows in its first lanes. */
+/* 4x8 kernel for <=4 leftover rows. */
 static inline void
 gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
                            const float *RESTRICT Ap,
@@ -291,7 +295,7 @@ int mul(float *RESTRICT C,
 
     const size_t M = row_a, K = column_a, N = column_b;
 
-    /* Scalar fallback or degenerate sizes */
+    /* Scalar fallback or small sizes */
     if (!linalg_has_avx2() || M == 0 || N == 0 || K == 0 ||
         (M < LINALG_SMALL_N_THRESH && N < LINALG_SMALL_N_THRESH))
     {
@@ -312,7 +316,7 @@ int mul(float *RESTRICT C,
 
 #if LINALG_SIMD_ENABLE
     const size_t Kc = (size_t)LINALG_BLOCK_KC; /* ~192–256 */
-    const size_t Nc = (size_t)LINALG_BLOCK_JC; /* outer-N tile (from header) */
+    const size_t Nc = (size_t)LINALG_BLOCK_JC; /* outer-N tile (header) */
     const size_t Mc = (size_t)LINALG_BLOCK_MC; /* outer-M tile */
 
     /* For each N tile */
@@ -412,7 +416,6 @@ int mul(float *RESTRICT C,
 
                 for (; i < i0 + ib_tile; ++i)
                 {
-                    /* pack 1 row */
                     pack_A_8row_tile(Ap, A, M, K, i, 1, kk, Kblk);
 
                     size_t panel_off = 0;
