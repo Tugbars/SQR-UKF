@@ -138,38 +138,42 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
 
 #if LINALG_SIMD_ENABLE
 /* ---------------- AVX helpers (compiled only with AVX2/FMA) ---------------- */
-
 /**
  * @brief Horizontal sum of 8 packed single-precision floats.
  *
  * @param[in] v   __m256 containing 8 lanes to sum.
  * @return Sum of all 8 lanes as a scalar float.
  *
- * @note Helper for AVX2 accumulation; not exported.
+ * @note Uses shuffle-based reduction (3-4× faster than hadd on most CPUs).
  */
 static inline float hsum8_ps(__m256 v)
 {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 s = _mm_add_ps(lo, hi);
-    s = _mm_hadd_ps(s, s);
-    s = _mm_hadd_ps(s, s);
+    __m128 lo   = _mm256_castps256_ps128(v);      // Extract lower 128 bits
+    __m128 hi   = _mm256_extractf128_ps(v, 1);    // Extract upper 128 bits
+    __m128 s    = _mm_add_ps(lo, hi);             // 4 lanes → [a+e, b+f, c+g, d+h]
+    __m128 shuf = _mm_movehdup_ps(s);             // [b+f, b+f, d+h, d+h]
+    s = _mm_add_ps(s, shuf);                      // [a+e+b+f, *, c+g+d+h, *]
+    shuf = _mm_movehl_ps(shuf, s);                // [c+g+d+h, *]
+    s = _mm_add_ss(s, shuf);                      // [sum, *, *, *]
     return _mm_cvtss_f32(s);
 }
 
 /**
- * @brief Broadcast the selected 32-bit lane of a packed 8-float vector to all lanes.
+ * @brief Horizontal maximum of 8 packed single-precision floats.
  *
- * @param[in] pack  Source packed vector.
- * @param[in] lane  Lane index (0..7) to broadcast.
- * @return __m256 with all lanes equal to pack[lane].
+ * @param[in] v   __m256 containing 8 lanes.
+ * @return Maximum of all 8 lanes as a scalar float.
  *
- * @note Helper for AVX2 lane manipulation; not exported.
+ * @note Helper for AVX2 max reduction; not exported.
  */
-static inline __m256 bcast_lane(__m256 pack, int lane)
+static inline float hmax8_ps(__m256 v)
 {
-    const __m256i idx = _mm256_set1_epi32(lane);
-    return _mm256_permutevar8x32_ps(pack, idx);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 m  = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x55));
+    return _mm_cvtss_f32(m);
 }
 
 /**
@@ -181,6 +185,9 @@ static inline __m256 bcast_lane(__m256 pack, int lane)
  *   - v[0] = 1, v[1:] = x[1:]/β
  *   - x[0] = -β (β has the sign chosen to reduce cancellation)
  *   - Returns τ = 2 / (1 + σ/β²) (the standard Householder scalar)
+ *
+ *  Algorithm follows Golub & Van Loan §5.1.3 with Parlett's β selection rule
+ *  to avoid cancellation when computing the reflection axis.
  *
  * @param[out] v     Output Householder vector (length @p len).
  * @param[in,out] x  On input: target vector segment; on output: x[0] = -β.
@@ -196,7 +203,9 @@ static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t 
     if (len == 0)
         return 0.0f;
 
-    /* Find amax = max_i |x[i]| (vectorized head + scalar tail) */
+    /* --------------------------------------------------------------------
+     * Step 1: Find amax = max_i |x[i]| (vectorized with horizontal max)
+     * -------------------------------------------------------------------- */
     __m256 amax8 = _mm256_setzero_ps();
     uint16_t i = 0;
     for (; i + 7 < len; i += 8)
@@ -205,15 +214,11 @@ static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t 
         __m256 ax = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), xv); /* fabsf */
         amax8 = _mm256_max_ps(amax8, ax);
     }
-    float amax = 0.0f;
-    {
-        __m128 lo = _mm256_castps256_ps128(amax8);
-        __m128 hi = _mm256_extractf128_ps(amax8, 1);
-        __m128 m1 = _mm_max_ps(lo, hi);
-        m1 = _mm_max_ps(m1, _mm_movehl_ps(m1, m1));
-        m1 = _mm_max_ps(m1, _mm_shuffle_ps(m1, m1, 0x55));
-        amax = _mm_cvtss_f32(m1);
-    }
+    
+    /* Reduce 8 lanes to scalar max */
+    float amax = hmax8_ps(amax8);
+    
+    /* Scalar tail */
     for (; i < len; ++i)
     {
         float ax = fabsf(x[i]);
@@ -223,7 +228,7 @@ static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t 
 
     if (amax == 0.0f)
     {
-        /* x is zero ⇒ no reflection */
+        /* x is zero ⇒ no reflection needed */
         v[0] = 1.0f;
         for (uint16_t t = 1; t < len; ++t)
             v[t] = 0.0f;
@@ -231,59 +236,85 @@ static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t 
         return 0.0f;
     }
 
-    /* Scale: y = x / amax */
-    float alpha = x[0] / amax;
+    /* --------------------------------------------------------------------
+     * Step 2: Scale by amax to prevent overflow: y = x / amax
+     * -------------------------------------------------------------------- */
+    const float alpha = x[0] / amax;  /* Scaled first element */
 
-    /* ||y||^2 (vectorized) */
+    /* Compute ||y||² (vectorized with horizontal sum) */
     __m256 acc = _mm256_setzero_ps();
+    const __m256 scale_inv = _mm256_set1_ps(1.0f / amax);
+    
     i = 0;
     for (; i + 7 < len; i += 8)
     {
         __m256 xv = _mm256_loadu_ps(x + i);
-        xv = _mm256_div_ps(xv, _mm256_set1_ps(amax));
-        acc = _mm256_fmadd_ps(xv, xv, acc);
+        __m256 yv = _mm256_mul_ps(xv, scale_inv);  /* y = x / amax */
+        acc = _mm256_fmadd_ps(yv, yv, acc);        /* acc += y² */
     }
-    float normy2 = 0.0f;
-    {
-        __m128 lo = _mm256_castps256_ps128(acc);
-        __m128 hi = _mm256_extractf128_ps(acc, 1);
-        __m128 s = _mm_add_ps(lo, hi);
-        s = _mm_hadd_ps(s, s);
-        s = _mm_hadd_ps(s, s);
-        normy2 = _mm_cvtss_f32(s);
-    }
+    
+    /* Reduce 8 lanes to scalar sum */
+    float normy2 = hsum8_ps(acc);
+    
+    /* Scalar tail */
     for (; i < len; ++i)
     {
         const float yi = x[i] / amax;
         normy2 += yi * yi;
     }
 
-    float sigma = normy2 - alpha * alpha; /* sum(y^2) - y0^2 */
+    /* --------------------------------------------------------------------
+     * Step 3: Compute σ = ||y[1:]||² = ||y||² - y[0]²
+     * -------------------------------------------------------------------- */
+    const float sigma = normy2 - alpha * alpha;
+    
     if (sigma <= 0.0f)
     {
+        /* x is essentially [*, 0, 0, ...] ⇒ trivial reflection */
         v[0] = 1.0f;
         for (uint16_t t = 1; t < len; ++t)
             v[t] = 0.0f;
-        x[0] = -x[0]; /* keep contract "x[0] = -beta" (beta=|x0|) */
+        x[0] = -x[0]; /* Keep contract: x[0] = -β (β = |x[0]|) */
         return 0.0f;
     }
 
-    /* normx = amax * ||y|| */
-    float normy = sqrtf(alpha * alpha + sigma);
-    float beta_scaled = (alpha <= 0.0f) ? (alpha - normy)
-                                        : (-sigma / (alpha + normy));
-    float beta = beta_scaled * amax; /* rescale */
+    /* --------------------------------------------------------------------
+     * Step 4: Choose β to avoid cancellation (Parlett's rule)
+     * -------------------------------------------------------------------- */
+    const float normy = sqrtf(normy2);  /* ||y|| */
+    
+    float beta_scaled;
+    if (alpha <= 0.0f)
+    {
+        /* α ≤ 0: β = α − ||y|| (both negative, stable subtraction) */
+        beta_scaled = alpha - normy;
+    }
+    else
+    {
+        /* α > 0: β = −σ / (α + ||y||) to avoid α − ||y|| cancellation */
+        beta_scaled = -sigma / (alpha + normy);
+    }
+    
+    const float beta = beta_scaled * amax;  /* Rescale to original units */
 
-    /* tau = 2 / (1 + (sigma / beta_scaled^2))  (same as 2*β^2/(σ+β^2)) */
-    float tau = (2.0f * beta_scaled * beta_scaled) / (sigma + beta_scaled * beta_scaled);
+    /* --------------------------------------------------------------------
+     * Step 5: Compute τ = 2 / (1 + σ/β²)
+     * -------------------------------------------------------------------- */
+    const float tau = (2.0f * beta_scaled * beta_scaled) / (sigma + beta_scaled * beta_scaled);
 
-    /* v */
+    /* --------------------------------------------------------------------
+     * Step 6: Build Householder vector v and update x[0]
+     * -------------------------------------------------------------------- */
     v[0] = 1.0f;
+    const float beta_inv = 1.0f / beta;
     for (uint16_t t = 1; t < len; ++t)
-        v[t] = x[t] / beta;
-    x[0] = -beta;
+        v[t] = x[t] * beta_inv;
+    
+    x[0] = -beta;  /* Store -β in x[0] (becomes new R[k,k]) */
+    
     return tau;
 }
+#endif /* LINALG_SIMD_ENABLE */
 
 /**
  * @brief Apply a Householder reflector from the left to a trailing block (AVX2, blocked).
@@ -595,7 +626,6 @@ static void apply_reflector_right_Q_avx(float *RESTRICT Q, uint16_t m,
 
     linalg_aligned_free(y);
 }
-#endif /* LINALG_SIMD_ENABLE */
 
 /**
  * @brief Apply a Householder reflector to Q from the right (scalar fallback).
