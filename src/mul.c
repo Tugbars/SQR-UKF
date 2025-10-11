@@ -25,8 +25,64 @@
 #define LINALG_GEMM_PF_MIN_K 128 /* enable within-row prefetch if Kblk ≥ */
 #endif
 
+/* ===== helper: AVX2 mask for N-tail (jb < 8) ===== */
+#if LINALG_SIMD_ENABLE
+static inline __m256i avx2_tailmask(int jb)
+{
+    /* lanes in ascending address order (setr) */
+    return _mm256_setr_epi32(
+        (jb > 0) ? -1 : 0,
+        (jb > 1) ? -1 : 0,
+        (jb > 2) ? -1 : 0,
+        (jb > 3) ? -1 : 0,
+        (jb > 4) ? -1 : 0,
+        (jb > 5) ? -1 : 0,
+        (jb > 6) ? -1 : 0,
+        (jb > 7) ? -1 : 0);
+}
+#endif
 
 /* ======================= Packing ======================= */
+
+/* ===== NEW: pack the whole (ib x Kblk) A tile once, in stripes of 8 rows =====
+   Layout:
+     For each 8-row stripe s (starting at i = i0 + 8*s), we store a dense Kblk×8
+     pack whose r-th row (0..7) at column k lives at:
+         Ap_off = s * (Kblk*8) + k*8 + r
+   Short stripes (final <8 rows) are zero-padded in r.
+*/
+static inline void
+pack_A_block_8row_striped(float *RESTRICT Ap,
+                          const float *RESTRICT A,
+                          size_t M, size_t K,
+                          size_t i0, size_t ib,
+                          size_t kk, size_t Kblk)
+{
+    (void)M; /* bounds guaranteed by caller */
+    const size_t n_stripes = (ib + 7) / 8;
+
+    for (size_t s = 0; s < n_stripes; ++s)
+    {
+        const size_t stripe_rows = ((s + 1) * 8 <= ib) ? 8 : (ib - s * 8);
+        const size_t Ap_base = s * (Kblk * 8);
+
+        for (size_t k = 0; k < Kblk; ++k)
+        {
+            float *dst = Ap + Ap_base + k * 8;
+
+            /* fill existing rows */
+            size_t r = 0;
+            for (; r < stripe_rows; ++r)
+            {
+                const size_t i = i0 + s * 8 + r;
+                dst[r] = A[i * K + (kk + k)];
+            }
+            /* pad rest with zeros */
+            for (; r < 8; ++r)
+                dst[r] = 0.0f;
+        }
+    }
+}
 
 /* Pack B tile (Kblk x jb) from row-major B into contiguous 8-col panels.
  * Layout: for each 8-wide panel, row k is at panel_base + k*8.
@@ -118,6 +174,7 @@ pack_A_8row_tile(float *RESTRICT Ap,
 
 /* ======================= Micro-kernels (AVX2/FMA) ======================= */
 
+/* ===== CHANGED: 8×8 kernel, dual-register blocking (16-step unroll) + masked tail ===== */
 #if LINALG_SIMD_ENABLE
 static inline void
 gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
@@ -134,10 +191,19 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     __m256 acc6 = _mm256_setzero_ps();
     __m256 acc7 = _mm256_setzero_ps();
 
-    /* NEW: tiny prefetch controls */
+    /* second tile accumulators (to hide FMA latency) */
+    __m256 acc0b = _mm256_setzero_ps();
+    __m256 acc1b = _mm256_setzero_ps();
+    __m256 acc2b = _mm256_setzero_ps();
+    __m256 acc3b = _mm256_setzero_ps();
+    __m256 acc4b = _mm256_setzero_ps();
+    __m256 acc5b = _mm256_setzero_ps();
+    __m256 acc6b = _mm256_setzero_ps();
+    __m256 acc7b = _mm256_setzero_ps();
+
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
 
-    /* NEW: optionally hint the C rows we’ll touch (helps when N is large & jb==8) */
+    /* L1/L2 prefetch for C rows touched by this kernel */
     _mm_prefetch((const char *)(c + 0 * ldc), _MM_HINT_T0);
     _mm_prefetch((const char *)(c + 1 * ldc), _MM_HINT_T0);
     _mm_prefetch((const char *)(c + 2 * ldc), _MM_HINT_T0);
@@ -147,17 +213,67 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     _mm_prefetch((const char *)(c + 6 * ldc), _MM_HINT_T0);
     _mm_prefetch((const char *)(c + 7 * ldc), _MM_HINT_T0);
 
+    _mm_prefetch((const char *)(c + 0 * ldc + 2 * ldc), _MM_HINT_T1);
+    _mm_prefetch((const char *)(c + 4 * ldc + 2 * ldc), _MM_HINT_T1);
+
     size_t k = 0;
-    for (; k + 7 < Kblk; k += 8)
+
+    /* dual-tile unroll by 16 */
+    for (; k + 15 < Kblk; k += 16)
     {
-        /* NEW: prefetch next unrolled B slab row */
         if (do_pf)
         {
-            size_t kpf = k + 8;
+            const size_t kpf = k + 16;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
 
+#define STEP8(BASE, AACC0, AACC1, AACC2, AACC3, AACC4, AACC5, AACC6, AACC7)          \
+    do                                                                               \
+    {                                                                                \
+        const __m256 b = _mm256_load_ps(Bp + (BASE) * 8);                            \
+        AACC0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 0), b, AACC0); \
+        AACC1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 1), b, AACC1); \
+        AACC2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 2), b, AACC2); \
+        AACC3 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 3), b, AACC3); \
+        AACC4 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 4), b, AACC4); \
+        AACC5 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 5), b, AACC5); \
+        AACC6 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 6), b, AACC6); \
+        AACC7 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + (BASE) * 8 + 7), b, AACC7); \
+    } while (0)
+
+        /* tile 0: k..k+7 */
+        STEP8(k + 0, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 1, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 2, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 3, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 4, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 5, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 6, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+        STEP8(k + 7, acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7);
+
+        /* tile 1: k+8..k+15 (independent acc set) */
+        STEP8(k + 8, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 9, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 10, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 11, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 12, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 13, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 14, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+        STEP8(k + 15, acc0b, acc1b, acc2b, acc3b, acc4b, acc5b, acc6b, acc7b);
+
+#undef STEP8
+    }
+
+    /* finish remainder ≥8 with single-tile path */
+    for (; k + 7 < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 8;
+            if (kpf < Kblk)
+                _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
+        }
 #define STEP(KOFF)                                                                       \
     do                                                                                   \
     {                                                                                    \
@@ -181,11 +297,13 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         STEP(7);
 #undef STEP
     }
+
+    /* scalar tail (k … Kblk-1) */
     for (; k < Kblk; ++k)
     {
         if (do_pf)
         {
-            size_t kpf = k + 1;
+            const size_t kpf = k + 1;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
@@ -200,6 +318,16 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
         acc7 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 7), b, acc7);
     }
 
+    /* fold dual-tile accumulators */
+    acc0 = _mm256_add_ps(acc0, acc0b);
+    acc1 = _mm256_add_ps(acc1, acc1b);
+    acc2 = _mm256_add_ps(acc2, acc2b);
+    acc3 = _mm256_add_ps(acc3, acc3b);
+    acc4 = _mm256_add_ps(acc4, acc4b);
+    acc5 = _mm256_add_ps(acc5, acc5b);
+    acc6 = _mm256_add_ps(acc6, acc6b);
+    acc7 = _mm256_add_ps(acc7, acc7b);
+
     if (jb == 8)
     {
         _mm256_storeu_ps(c + 0 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 0 * ldc), acc0));
@@ -213,27 +341,29 @@ gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     }
     else
     {
-        alignas(32) float buf[8];
-#define ADD_TAIL(ROW, ACCV)             \
-    do                                  \
-    {                                   \
-        _mm256_store_ps(buf, (ACCV));   \
-        float *cd = c + (ROW) * ldc;    \
-        for (size_t t = 0; t < jb; ++t) \
-            cd[t] += buf[t];            \
+        const __m256i m = avx2_tailmask((int)jb);
+#define MASKED_ADD_STORE(ROW, ACC)                            \
+    do                                                        \
+    {                                                         \
+        __m256 oldv = _mm256_maskload_ps(c + (ROW) * ldc, m); \
+        __m256 sum = _mm256_add_ps(oldv, (ACC));              \
+        _mm256_maskstore_ps(c + (ROW) * ldc, m, sum);         \
     } while (0)
-        ADD_TAIL(0, acc0);
-        ADD_TAIL(1, acc1);
-        ADD_TAIL(2, acc2);
-        ADD_TAIL(3, acc3);
-        ADD_TAIL(4, acc4);
-        ADD_TAIL(5, acc5);
-        ADD_TAIL(6, acc6);
-        ADD_TAIL(7, acc7);
-#undef ADD_TAIL
+        MASKED_ADD_STORE(0, acc0);
+        MASKED_ADD_STORE(1, acc1);
+        MASKED_ADD_STORE(2, acc2);
+        MASKED_ADD_STORE(3, acc3);
+        MASKED_ADD_STORE(4, acc4);
+        MASKED_ADD_STORE(5, acc5);
+        MASKED_ADD_STORE(6, acc6);
+        MASKED_ADD_STORE(7, acc7);
+#undef MASKED_ADD_STORE
     }
 }
+#endif
 
+/* ===== CHANGED: 4×8 kernel adds masked tail + light L2 prefetch ===== */
+#if LINALG_SIMD_ENABLE
 static inline void
 gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
                            const float *RESTRICT Ap,
@@ -251,17 +381,17 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     _mm_prefetch((const char *)(c + 1 * ldc), _MM_HINT_T0);
     _mm_prefetch((const char *)(c + 2 * ldc), _MM_HINT_T0);
     _mm_prefetch((const char *)(c + 3 * ldc), _MM_HINT_T0);
+    _mm_prefetch((const char *)(c + 2 * ldc + 2 * ldc), _MM_HINT_T1);
 
     size_t k = 0;
     for (; k + 7 < Kblk; k += 8)
     {
         if (do_pf)
         {
-            size_t kpf = k + 8;
+            const size_t kpf = k + 8;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
-
 #define STEP(T)                                                                       \
     do                                                                                \
     {                                                                                 \
@@ -285,7 +415,7 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     {
         if (do_pf)
         {
-            size_t kpf = k + 1;
+            const size_t kpf = k + 1;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
@@ -305,23 +435,24 @@ gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     }
     else
     {
-        alignas(32) float buf[8];
-#define ADD_TAIL4(ROW, ACCV)            \
-    do                                  \
-    {                                   \
-        _mm256_store_ps(buf, (ACCV));   \
-        float *cd = c + (ROW) * ldc;    \
-        for (size_t t = 0; t < jb; ++t) \
-            cd[t] += buf[t];            \
+        const __m256i m = avx2_tailmask((int)jb);
+#define MASKED_ADD_STORE4(ROW, ACC)                           \
+    do                                                        \
+    {                                                         \
+        __m256 oldv = _mm256_maskload_ps(c + (ROW) * ldc, m); \
+        __m256 sum = _mm256_add_ps(oldv, (ACC));              \
+        _mm256_maskstore_ps(c + (ROW) * ldc, m, sum);         \
     } while (0)
-        ADD_TAIL4(0, acc0);
-        ADD_TAIL4(1, acc1);
-        ADD_TAIL4(2, acc2);
-        ADD_TAIL4(3, acc3);
-#undef ADD_TAIL4
+        MASKED_ADD_STORE4(0, acc0);
+        MASKED_ADD_STORE4(1, acc1);
+        MASKED_ADD_STORE4(2, acc2);
+        MASKED_ADD_STORE4(3, acc3);
+#undef MASKED_ADD_STORE4
     }
 }
+#endif
 
+#if LINALG_SIMD_ENABLE
 static inline void
 gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
                            const float *RESTRICT Ap,
@@ -329,7 +460,6 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
                            size_t Kblk, size_t jb /*<=8*/)
 {
     __m256 acc = _mm256_setzero_ps();
-
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
 
     _mm_prefetch((const char *)(c + 0), _MM_HINT_T0);
@@ -339,11 +469,10 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
     {
         if (do_pf)
         {
-            size_t kpf = k + 8;
+            const size_t kpf = k + 8;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
-
 #define STEP1(T)                                                                    \
     do                                                                              \
     {                                                                               \
@@ -364,7 +493,7 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
     {
         if (do_pf)
         {
-            size_t kpf = k + 1;
+            const size_t kpf = k + 1;
             if (kpf < Kblk)
                 _mm_prefetch((const char *)(Bp + kpf * 8), _MM_HINT_T0);
         }
@@ -378,13 +507,13 @@ gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
     }
     else
     {
-        alignas(32) float buf[8];
-        _mm256_store_ps(buf, acc);
-        for (size_t t = 0; t < jb; ++t)
-            c[t] += buf[t];
+        const __m256i m = avx2_tailmask((int)jb);
+        __m256 oldv = _mm256_maskload_ps(c, m);
+        __m256 sum = _mm256_add_ps(oldv, acc);
+        _mm256_maskstore_ps(c, m, sum);
     }
 }
-#endif // LINALG_SIMD_ENABLE
+#endif
 
 /* ======================= Top-level GEMM ======================= */
 
@@ -399,7 +528,6 @@ int mul(float *RESTRICT C,
 
     const size_t M = row_a, K = column_a, N = column_b;
 
-    /* Scalar fallback or small sizes */
     if (!linalg_has_avx2() || M == 0 || N == 0 || K == 0 ||
         (M < LINALG_SMALL_N_THRESH && N < LINALG_SMALL_N_THRESH))
     {
@@ -419,70 +547,69 @@ int mul(float *RESTRICT C,
     }
 
 #if LINALG_SIMD_ENABLE
-    const size_t Kc = (size_t)LINALG_BLOCK_KC; /* ~192–256 */
-    const size_t Nc = (size_t)LINALG_BLOCK_JC; /* outer-N tile (header) */
-    const size_t Mc = (size_t)LINALG_BLOCK_MC; /* outer-M tile */
+    const size_t Kc = (size_t)LINALG_BLOCK_KC;
+    const size_t Nc = (size_t)LINALG_BLOCK_JC;
+    const size_t Mc = (size_t)LINALG_BLOCK_MC;
 
-    /* For each N tile */
     for (size_t j0 = 0; j0 < N; j0 += Nc)
     {
         const size_t jb_tile = (j0 + Nc <= N) ? Nc : (N - j0);
         const size_t n_panels_tile = (jb_tile + 7) / 8;
 
-        size_t Bp_elems = Kc * n_panels_tile * 8;
+        const size_t Bp_elems = Kc * n_panels_tile * 8;
         float *Bp = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, Bp_elems * sizeof(float));
         if (!Bp)
             return -ENOMEM;
 
-        /* Iterate K slabs; repack B each slab for current j-tile */
         for (size_t kk = 0; kk < K; kk += Kc)
         {
             const size_t Kblk = (kk + Kc <= K) ? Kc : (K - kk);
 
-            /* --- NEW: mild L2 hints for the *next* B slab (same j tile) --- */
+            /* L2 hints for next B slab within the same j-tile */
             if (kk + Kblk < K)
             {
                 const size_t kk_next = kk + Kblk;
-                /* stride roughly one cache line per row in this j-tile */
                 const size_t step = (size_t)(64 / sizeof(float));
-                size_t jpf = j0, jpf_end = j0 + jb_tile;
-                for (; jpf < jpf_end; jpf += step)
+                for (size_t jpf = j0, jpf_end = j0 + jb_tile; jpf < jpf_end; jpf += step)
                 {
                     _mm_prefetch((const char *)(B + kk_next * N + jpf), _MM_HINT_T1);
                 }
             }
 
-            /* Pack B (kk..kk+Kblk, j0..j0+jb_tile) into 8-col panels */
+            /* repack B slab for this j-tile */
             pack_B_8col_tile(Bp, B, K, N, kk, Kblk, j0, jb_tile);
 
-            /* A pack buffer for up to 8 rows x Kblk */
-            size_t Ap_elems = Kblk * 8;
-            float *Ap = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, Ap_elems * sizeof(float));
-            if (!Ap)
-            {
-                linalg_aligned_free(Bp);
-                return -ENOMEM;
-            }
-
-            /* For each M tile */
             for (size_t i0 = 0; i0 < M; i0 += Mc)
             {
                 const size_t ib_tile = (i0 + Mc <= M) ? Mc : (M - i0);
 
-                /* --- NEW: coarse L2 hints for A rows of this i-tile & current kk slab --- */
+                /* L2 hints for A rows of this i-tile & current kk slab */
+                for (size_t ipf = i0, ipf_end = i0 + ib_tile; ipf < ipf_end; ipf += 8)
                 {
-                    const size_t step_rows = 8; /* coarse row stride */
-                    for (size_t ipf = i0, ipf_end = i0 + ib_tile; ipf < ipf_end; ipf += step_rows)
-                    {
-                        _mm_prefetch((const char *)(A + ipf * K + kk), _MM_HINT_T1);
-                    }
+                    _mm_prefetch((const char *)(A + ipf * K + kk), _MM_HINT_T1);
                 }
 
-                /* Process rows in chunks of 8, then 4, then 1 */
-                size_t i = i0;
-                for (; i + 7 < i0 + ib_tile; i += 8)
+                /* ===== pack A ONCE for this (i0×Kblk) tile into stripes of 8 rows ===== */
+                const size_t n_stripes = (ib_tile + 7) / 8;
+                const size_t Ap_elems = n_stripes * Kblk * 8;
+                float *Ap = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, Ap_elems * sizeof(float));
+                if (!Ap)
                 {
-                    pack_A_8row_tile(Ap, A, M, K, i, 8, kk, Kblk);
+                    linalg_aligned_free(Bp);
+                    return -ENOMEM;
+                }
+
+                pack_A_block_8row_striped(Ap, A, M, K, i0, ib_tile, kk, Kblk);
+
+                /* ===== compute C using packed A stripes ===== */
+                /* rows in chunks of 8, then 4, then 1 within the tile */
+                size_t i = 0;
+
+                /* 8-row stripes (fully packed) */
+                for (; i + 7 < ib_tile; i += 8)
+                {
+                    const size_t stripe_idx = i / 8;
+                    const float *Ap_stripe = Ap + stripe_idx * (Kblk * 8);
 
                     size_t panel_off = 0;
                     for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 8, panel_off += Kblk * 8)
@@ -493,23 +620,26 @@ int mul(float *RESTRICT C,
                         {
                             for (size_t r = 0; r < 8; ++r)
                             {
-                                float *cr = C + (i + r) * N + j;
+                                float *cr = C + (i0 + i + r) * N + j;
                                 for (size_t t = 0; t < jb; ++t)
                                     cr[t] = 0.0f;
                             }
                         }
 
                         gemm_8x8_panel_avx2fma_add(
-                            C + i * N + j, N,
-                            Ap,
+                            C + (i0 + i) * N + j, N,
+                            Ap_stripe,
                             Bp + panel_off,
                             Kblk, jb);
                     }
                 }
 
-                for (; i + 3 < i0 + ib_tile; i += 4)
+                /* leftover rows 4..7: use the same packed stripe (it’s zero-padded) */
+                for (; i + 3 < ib_tile; i += 4)
                 {
-                    pack_A_8row_tile(Ap, A, M, K, i, 4, kk, Kblk);
+                    const size_t stripe_idx = i / 8; /* either last full stripe or the short stripe */
+                    const size_t r_in_stripe = i - stripe_idx * 8;
+                    const float *Ap_stripe = Ap + stripe_idx * (Kblk * 8) + r_in_stripe;
 
                     size_t panel_off = 0;
                     for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 8, panel_off += Kblk * 8)
@@ -520,23 +650,26 @@ int mul(float *RESTRICT C,
                         {
                             for (size_t r = 0; r < 4; ++r)
                             {
-                                float *cr = C + (i + r) * N + j;
+                                float *cr = C + (i0 + i + r) * N + j;
                                 for (size_t t = 0; t < jb; ++t)
                                     cr[t] = 0.0f;
                             }
                         }
 
                         gemm_4x8_panel_avx2fma_add(
-                            C + i * N + j, N,
-                            Ap,
+                            C + (i0 + i) * N + j, N,
+                            Ap_stripe, /* points to row r_in_stripe.. in that stripe */
                             Bp + panel_off,
                             Kblk, jb);
                     }
                 }
 
-                for (; i < i0 + ib_tile; ++i)
+                /* singly leftover rows */
+                for (; i < ib_tile; ++i)
                 {
-                    pack_A_8row_tile(Ap, A, M, K, i, 1, kk, Kblk);
+                    const size_t stripe_idx = i / 8;
+                    const size_t r_in_stripe = i - stripe_idx * 8;
+                    const float *Ap_row = Ap + stripe_idx * (Kblk * 8) + r_in_stripe;
 
                     size_t panel_off = 0;
                     for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 8, panel_off += Kblk * 8)
@@ -545,21 +678,21 @@ int mul(float *RESTRICT C,
 
                         if (kk == 0)
                         {
-                            float *cr = C + i * N + j;
+                            float *cr = C + (i0 + i) * N + j;
                             for (size_t t = 0; t < jb; ++t)
                                 cr[t] = 0.0f;
                         }
 
                         gemm_1x8_panel_avx2fma_add(
-                            C + i * N + j,
-                            Ap,
+                            C + (i0 + i) * N + j,
+                            Ap_row,
                             Bp + panel_off,
                             Kblk, jb);
                     }
                 }
-            } /* i0 over Mc */
 
-            linalg_aligned_free(Ap);
+                linalg_aligned_free(Ap);
+            } /* i0 over Mc */
         } /* kk over Kc */
 
         linalg_aligned_free(Bp);
