@@ -57,13 +57,26 @@
 #endif
 
 #ifndef UKF_UPD_COLBLOCK
-#define UKF_UPD_COLBLOCK 64   /* RHS column block for triangular solves */
+#define UKF_UPD_COLBLOCK 64 /* RHS column block for triangular solves */
 #endif
 #ifndef UKF_UPD_PF_MIN_N
-#define UKF_UPD_PF_MIN_N 128  /* enable prefetch in solves when n >= this */
+#define UKF_UPD_PF_MIN_N 128 /* enable prefetch in solves when n >= this */
 #endif
 #ifndef UKF_UPD_PF_DIST_BYTES
 #define UKF_UPD_PF_DIST_BYTES 128 /* prefetch distance along RHS rows */
+#endif
+
+#ifndef UKF_PXY_PF_MIN_L
+#define UKF_PXY_PF_MIN_L 16 /* enable row-ahead prefetch when L >= this */
+#endif
+#ifndef UKF_PXY_PF_MIN_N
+#define UKF_PXY_PF_MIN_N 32 /* enable within-row prefetch when N >= this */
+#endif
+#ifndef UKF_PXY_PF_ROWS_AHEAD
+#define UKF_PXY_PF_ROWS_AHEAD 1 /* 0..2 sensible */
+#endif
+#ifndef UKF_PXY_PF_DIST_BYTES
+#define UKF_PXY_PF_DIST_BYTES 128 /* 64 or 128 are typical */
 #endif
 
 static inline void *ukf_aligned_alloc(size_t nbytes)
@@ -841,6 +854,40 @@ static void H(float Y[], float X[], uint8_t L)
     memcpy(Y, X, (size_t)L * N * sizeof(float));
 }
 
+static inline size_t ukf_round_up8(size_t n) { return (n + 7u) & ~7u; }
+
+#if LINALG_SIMD_ENABLE
+static inline void ukf_transpose8x8_ps(__m256 in[8], __m256 out[8])
+{
+    __m256 t0 = _mm256_unpacklo_ps(in[0], in[1]);
+    __m256 t1 = _mm256_unpackhi_ps(in[0], in[1]);
+    __m256 t2 = _mm256_unpacklo_ps(in[2], in[3]);
+    __m256 t3 = _mm256_unpackhi_ps(in[2], in[3]);
+    __m256 t4 = _mm256_unpacklo_ps(in[4], in[5]);
+    __m256 t5 = _mm256_unpackhi_ps(in[4], in[5]);
+    __m256 t6 = _mm256_unpacklo_ps(in[6], in[7]);
+    __m256 t7 = _mm256_unpackhi_ps(in[6], in[7]);
+
+    __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x4E);
+    __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xB1);
+    __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x4E);
+    __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xB1);
+    __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x4E);
+    __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xB1);
+    __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x4E);
+    __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xB1);
+
+    out[0] = _mm256_permute2f128_ps(s0, s4, 0x20);
+    out[1] = _mm256_permute2f128_ps(s1, s5, 0x20);
+    out[2] = _mm256_permute2f128_ps(s2, s6, 0x20);
+    out[3] = _mm256_permute2f128_ps(s3, s7, 0x20);
+    out[4] = _mm256_permute2f128_ps(s0, s4, 0x31);
+    out[5] = _mm256_permute2f128_ps(s1, s5, 0x31);
+    out[6] = _mm256_permute2f128_ps(s2, s6, 0x31);
+    out[7] = _mm256_permute2f128_ps(s3, s7, 0x31);
+}
+#endif
+
 /**
  * @brief Cross-covariance Pxy = X_c * diag(W) * Y_c^T without explicit diag matrix.
  *
@@ -864,183 +911,200 @@ static void H(float Y[], float X[], uint8_t L)
  *
  * @warning X and Y are centered in-place (destructive). If needed elsewhere, pass copies.
  */
-static void create_state_cross_covariance_matrix(float P[], float W[],
-                                                 float X[], float Y[],
-                                                 float x[], float y[],
+static void create_state_cross_covariance_matrix(float *RESTRICT P, float *RESTRICT W,
+                                                 const float *RESTRICT X, const float *RESTRICT Y,
+                                                 const float *RESTRICT x, const float *RESTRICT y,
                                                  uint8_t L8)
 {
-    const uint16_t L = (uint16_t)L8;
-    const uint16_t N = (uint16_t)(2 * L + 1);
-    const size_t LL = (size_t)L;
-    const size_t NN = (size_t)N;
+    const size_t L = (size_t)L8;
+    const size_t N = 2u * L + 1u;
+    const size_t N8 = ukf_round_up8(N);
 
-    /* --- clear P (L*L) --- */
-    memset(P, 0, (size_t)LL * LL * sizeof(float));
+    memset(P, 0, L * L * sizeof(float));
 
-    /* --- Center X and Y (row-major, contiguous across j) --- */
+    float *Xc = (float *)linalg_aligned_alloc(32, L * N8 * sizeof(float));
+    float *YTc = (float *)linalg_aligned_alloc(32, N8 * L * sizeof(float));
+    if (!Xc || !YTc)
+    {
+        if (Xc)
+            linalg_aligned_free(Xc);
+        if (YTc)
+            linalg_aligned_free(YTc);
+        return;
+    }
+
+    /* Prefetch policy */
+    const int do_pf_rows = (int)(L >= (size_t)UKF_PXY_PF_MIN_L);
+    const int do_pf_in = (int)(N >= (size_t)UKF_PXY_PF_MIN_N);
+    const int rows_ahead = UKF_PXY_PF_ROWS_AHEAD;
+    const size_t pf_elems = (size_t)UKF_PXY_PF_DIST_BYTES / sizeof(float);
+
+    /* ---------------- Xc build: (X - x) ⊙ W, pad to N8 ---------------- */
+#if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && N >= 8)
     {
-        float *Tx = (float *)ukf_aligned_alloc(NN * sizeof(float));
-        if (!Tx)
-        { /* ... scalar fallback as in your code ... */
-            return;
-        }
-
-        const int do_pf = (N >= (uint16_t)UKF_PXY_PF_MIN_N);
-        const size_t pf_elts = (size_t)UKF_PXY_PF_DIST_BYTES / sizeof(float);
-        const int rows_ahead = UKF_PXY_PF_ROWS_AHEAD;
-
-        for (uint16_t i = 0; i < L; ++i)
+        for (size_t i = 0; i < L; ++i)
         {
-            const float *Xi = X + (size_t)i * NN;
+            const float *Xi = X + i * N;
+            float *Xci = Xc + i * N8;
+            const __m256 xi8 = _mm256_set1_ps(x[i]);
 
-            /* Tx = W ⊙ Xi (streaming along j); prefetch ahead within this row */
+            /* row-ahead prefetch for next X rows and their Xc destinations */
+            if (do_pf_rows && rows_ahead > 0)
+            {
+                for (int ra = 1; ra <= rows_ahead; ++ra)
+                {
+                    size_t ip = i + (size_t)ra;
+                    if (ip < L)
+                    {
+                        _mm_prefetch((const char *)(X + ip * N), _MM_HINT_T0);
+                        _mm_prefetch((const char *)(Xc + ip * N8), _MM_HINT_T0);
+                    }
+                }
+            }
+
             size_t j = 0;
-            for (; j + 7 < NN; j += 8)
+            for (; j + 7 < N; j += 8)
             {
-                if (do_pf && j + pf_elts + 8 < NN)
+                if (do_pf_in && j + pf_elems + 8 < N)
                 {
-                    _mm_prefetch((const char *)(W + j + pf_elts), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(Xi + j + pf_elts), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(Xi + j + pf_elems), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(W + j + pf_elems), _MM_HINT_T0);
                 }
-                __m256 wv = _mm256_loadu_ps(W + j);
                 __m256 xv = _mm256_loadu_ps(Xi + j);
-                _mm256_storeu_ps(Tx + j, _mm256_mul_ps(wv, xv));
+                __m256 wv = _mm256_loadu_ps(W + j);
+                __m256 diff = _mm256_sub_ps(xv, xi8);
+                _mm256_storeu_ps(Xci + j, _mm256_mul_ps(diff, wv));
             }
-            for (; j < NN; ++j)
-                Tx[j] = W[j] * Xi[j];
-
-            /* k in blocks of 4: dot( Tx, Yk ) */
-            uint16_t k = 0;
-            for (; k + 3 < L; k += 4)
-            {
-                const float *Y0 = Y + (size_t)(k + 0) * NN;
-                const float *Y1 = Y + (size_t)(k + 1) * NN;
-                const float *Y2 = Y + (size_t)(k + 2) * NN;
-                const float *Y3 = Y + (size_t)(k + 3) * NN;
-
-                __m256 acc0 = _mm256_setzero_ps();
-                __m256 acc1 = _mm256_setzero_ps();
-                __m256 acc2 = _mm256_setzero_ps();
-                __m256 acc3 = _mm256_setzero_ps();
-
-                size_t t = 0;
-                for (; t + 7 < NN; t += 8)
-                {
-                    if (do_pf && t + pf_elts + 8 < NN)
-                    {
-                        /* stream within-row prefetch */
-                        _mm_prefetch((const char *)(Tx + t + pf_elts), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Y0 + t + pf_elts), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Y1 + t + pf_elts), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Y2 + t + pf_elts), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Y3 + t + pf_elts), _MM_HINT_T0);
-                    }
-
-                    __m256 tx = _mm256_loadu_ps(Tx + t);
-                    acc0 = _mm256_fmadd_ps(tx, _mm256_loadu_ps(Y0 + t), acc0);
-                    acc1 = _mm256_fmadd_ps(tx, _mm256_loadu_ps(Y1 + t), acc1);
-                    acc2 = _mm256_fmadd_ps(tx, _mm256_loadu_ps(Y2 + t), acc2);
-                    acc3 = _mm256_fmadd_ps(tx, _mm256_loadu_ps(Y3 + t), acc3);
-                }
-                float s0, s1, s2, s3;
-                { /* horizontal sums */
-                    __m128 a0 = _mm_add_ps(_mm256_castps256_ps128(acc0),
-                                           _mm256_extractf128_ps(acc0, 1));
-                    a0 = _mm_hadd_ps(a0, a0);
-                    a0 = _mm_hadd_ps(a0, a0);
-                    s0 = _mm_cvtss_f32(a0);
-
-                    __m128 a1 = _mm_add_ps(_mm256_castps256_ps128(acc1),
-                                           _mm256_extractf128_ps(acc1, 1));
-                    a1 = _mm_hadd_ps(a1, a1);
-                    a1 = _mm_hadd_ps(a1, a1);
-                    s1 = _mm_cvtss_f32(a1);
-
-                    __m128 a2 = _mm_add_ps(_mm256_castps256_ps128(acc2),
-                                           _mm256_extractf128_ps(acc2, 1));
-                    a2 = _mm_hadd_ps(a2, a2);
-                    a2 = _mm_hadd_ps(a2, a2);
-                    s2 = _mm_cvtss_f32(a2);
-
-                    __m128 a3 = _mm_add_ps(_mm256_castps256_ps128(acc3),
-                                           _mm256_extractf128_ps(acc3, 1));
-                    a3 = _mm_hadd_ps(a3, a3);
-                    a3 = _mm_hadd_ps(a3, a3);
-                    s3 = _mm_cvtss_f32(a3);
-                }
-                for (; t < NN; ++t)
-                { /* scalar tail */
-                    const float tx = Tx[t];
-                    s0 += tx * Y0[t];
-                    s1 += tx * Y1[t];
-                    s2 += tx * Y2[t];
-                    s3 += tx * Y3[t];
-                }
-
-                float *Pi = P + (size_t)i * LL;
-                Pi[k + 0] += s0;
-                Pi[k + 1] += s1;
-                Pi[k + 2] += s2;
-                Pi[k + 3] += s3;
-
-                /* prefetch a few future Y rows for next k-block */
-                if (do_pf && rows_ahead > 0 && (uint16_t)(k + 4) < L)
-                {
-                    for (int ra = 1; ra <= rows_ahead; ++ra)
-                    {
-                        uint16_t kp = (uint16_t)(k + 4 + ra);
-                        if (kp < L)
-                            _mm_prefetch((const char *)(Y + (size_t)kp * NN), _MM_HINT_T0);
-                    }
-                }
-            }
-
-            /* leftover k (0..3): unchanged from your version, or add light prefetch if you’d like */
-            for (; k < L; ++k)
-            {
-                const float *Yk = Y + (size_t)k * NN;
-                __m256 acc = _mm256_setzero_ps();
-                size_t t = 0;
-                for (; t + 7 < NN; t += 8)
-                {
-                    if (do_pf && t + pf_elts + 8 < NN)
-                    {
-                        _mm_prefetch((const char *)(Tx + t + pf_elts), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Yk + t + pf_elts), _MM_HINT_T0);
-                    }
-                    __m256 tx = _mm256_loadu_ps(Tx + t);
-                    acc = _mm256_fmadd_ps(tx, _mm256_loadu_ps(Yk + t), acc);
-                }
-                __m128 ah = _mm_add_ps(_mm256_castps256_ps128(acc),
-                                       _mm256_extractf128_ps(acc, 1));
-                ah = _mm_hadd_ps(ah, ah);
-                ah = _mm_hadd_ps(ah, ah);
-                float sum = _mm_cvtss_f32(ah);
-                for (; t < NN; ++t)
-                    sum += Tx[t] * Yk[t];
-                P[(size_t)i * LL + k] += sum;
-            }
+            for (; j < N; ++j)
+                Xci[j] = (Xi[j] - x[i]) * W[j];
+            for (; j < N8; ++j)
+                Xci[j] = 0.0f;
         }
-
-        ukf_aligned_free(Tx);
     }
     else
+#endif
     {
-        /* scalar fallback: correct and simple */
-        for (uint16_t i = 0; i < L; ++i)
+        for (size_t i = 0; i < L; ++i)
         {
-            const float *Xi = X + (size_t)i * NN;
-            for (uint16_t k = 0; k < L; ++k)
+            const float *Xi = X + i * N;
+            float *Xci = Xc + i * N8;
+
+            if (do_pf_rows && rows_ahead > 0)
             {
-                const float *Yk = Y + (size_t)k * NN;
-                float acc = 0.0f;
-                for (uint16_t j = 0; j < N; ++j)
-                    acc += W[j] * Xi[j] * Yk[j];
-                P[(size_t)i * LL + k] += acc;
+                for (int ra = 1; ra <= rows_ahead; ++ra)
+                {
+                    size_t ip = i + (size_t)ra;
+                    if (ip < L)
+                        _mm_prefetch((const char *)(X + ip * N), _MM_HINT_T0);
+                }
             }
+
+            size_t j = 0;
+            for (; j < N; ++j)
+            {
+                if (do_pf_in && j + pf_elems + 1 < N)
+                {
+                    _mm_prefetch((const char *)(Xi + j + pf_elems), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(W + j + pf_elems), _MM_HINT_T0);
+                }
+                Xci[j] = (Xi[j] - x[i]) * W[j];
+            }
+            for (; j < N8; ++j)
+                Xci[j] = 0.0f;
         }
     }
+
+    /* ---------------- YTc build: centered Y^T (N8×L) with AVX2 8×8 transpose ---------------- */
+#if LINALG_SIMD_ENABLE
+    if (ukf_has_avx2() && N >= 8 && L >= 8)
+    {
+        /* zero pad rows j=N..N8-1 up-front (contiguous) */
+        for (size_t jp = N; jp < N8; ++jp)
+            memset(YTc + jp * L, 0, L * sizeof(float));
+
+        size_t k0 = 0;
+        for (; k0 + 7 < L; k0 += 8)
+        {
+            /* prefetch upcoming Y rows */
+            if (do_pf_rows && rows_ahead > 0)
+            {
+                for (int ra = 1; ra <= rows_ahead; ++ra)
+                {
+                    size_t kp = k0 + (size_t)ra * 8;
+                    if (kp < L)
+                        _mm_prefetch((const char *)(Y + kp * N), _MM_HINT_T0);
+                }
+            }
+
+            size_t j0 = 0;
+            for (; j0 + 7 < N; j0 += 8)
+            {
+                /* within-row stream prefetch */
+                if (do_pf_in && j0 + pf_elems + 8 < N)
+                {
+                    for (int r = 0; r < 8; ++r)
+                        _mm_prefetch((const char *)(Y + (k0 + (size_t)r) * N + j0 + pf_elems), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(YTc + (j0 + pf_elems) * L + k0), _MM_HINT_T0);
+                }
+
+                __m256 row[8];
+                for (int r = 0; r < 8; ++r)
+                {
+                    const float *Yr = Y + (k0 + (size_t)r) * N + j0;
+                    __m256 yr = _mm256_set1_ps(y[k0 + (size_t)r]);
+                    row[r] = _mm256_sub_ps(_mm256_loadu_ps(Yr), yr);
+                }
+                __m256 col[8];
+                ukf_transpose8x8_ps(row, col);
+
+                for (int c = 0; c < 8; ++c)
+                    _mm256_storeu_ps(YTc + (j0 + (size_t)c) * L + k0, col[c]);
+            }
+            /* N-tail for these 8 rows */
+            for (; j0 < N; ++j0)
+            {
+                float *YTrow = YTc + j0 * L;
+                for (int r = 0; r < 8; ++r)
+                    YTrow[k0 + (size_t)r] = Y[(k0 + (size_t)r) * N + j0] - y[k0 + (size_t)r];
+            }
+        }
+        /* L-tail rows */
+        for (; k0 < L; ++k0)
+        {
+            size_t j = 0;
+            for (; j < N; ++j)
+                YTc[j * L + k0] = Y[k0 * N + j] - y[k0];
+            for (; j < N8; ++j)
+                YTc[j * L + k0] = 0.0f;
+        }
+    }
+    else
+#endif
+    {
+        for (size_t j = 0; j < N; ++j)
+        {
+            const float *Ycol0 = Y + j; /* Y[k*N + j] */
+            float *YTrow = YTc + j * L;
+            for (size_t k = 0; k < L; ++k)
+                YTrow[k] = Ycol0[k * N] - y[k];
+        }
+        for (size_t j = N; j < N8; ++j)
+            memset(YTc + j * L, 0, L * sizeof(float));
+    }
+
+    /* ---------------- GEMM: P = Xc * YTc ----------------
+       Optional light prefetch hint for mul()’s first panels. */
+    if (do_pf_rows)
+    {
+        _mm_prefetch((const char *)Xc, _MM_HINT_T0);
+        _mm_prefetch((const char *)YTc, _MM_HINT_T0);
+        _mm_prefetch((const char *)P, _MM_HINT_T0);
+    }
+    mul(P, Xc, YTc, (uint16_t)L, (uint16_t)N8, (uint16_t)N8, (uint16_t)L);
+
+    linalg_aligned_free(Xc);
+    linalg_aligned_free(YTc);
 }
 
 /**
