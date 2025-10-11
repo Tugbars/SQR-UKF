@@ -133,38 +133,96 @@ static inline __m256 bcast_lane(__m256 pack, int lane)
     return _mm256_permutevar8x32_ps(pack, idx);
 }
 
-/* Householder for x (len): returns tau, writes v (v[0]=1, v[1:]=x/beta), and sets x[0] = -beta */
+/* Robust Householder: scales by max|x| to avoid overflow/underflow.
+   Returns tau; writes v (v[0]=1, v[1:]=x/beta); sets x[0] = -beta.
+   Same signature, drop-in. */
 static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t len)
 {
     if (len == 0)
-    {
         return 0.0f;
-    }
-    __m256 acc = _mm256_setzero_ps();
+
+    /* Find amax = max_i |x[i]| (vectorized head + scalar tail) */
+    __m256 amax8 = _mm256_setzero_ps();
     uint16_t i = 0;
     for (; i + 7 < len; i += 8)
     {
         __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 ax = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), xv); /* fabsf */
+        amax8 = _mm256_max_ps(amax8, ax);
+    }
+    float amax = 0.0f;
+    {
+        __m128 lo = _mm256_castps256_ps128(amax8);
+        __m128 hi = _mm256_extractf128_ps(amax8, 1);
+        __m128 m1 = _mm_max_ps(lo, hi);
+        m1 = _mm_max_ps(m1, _mm_movehl_ps(m1, m1));
+        m1 = _mm_max_ps(m1, _mm_shuffle_ps(m1, m1, 0x55));
+        amax = _mm_cvtss_f32(m1);
+    }
+    for (; i < len; ++i)
+    {
+        float ax = fabsf(x[i]);
+        if (ax > amax)
+            amax = ax;
+    }
+
+    if (amax == 0.0f)
+    {
+        /* x is zero ⇒ no reflection */
+        v[0] = 1.0f;
+        for (uint16_t t = 1; t < len; ++t)
+            v[t] = 0.0f;
+        x[0] = 0.0f;
+        return 0.0f;
+    }
+
+    /* Scale: y = x / amax */
+    float alpha = x[0] / amax;
+
+    /* ||y||^2 (vectorized) */
+    __m256 acc = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 7 < len; i += 8)
+    {
+        __m256 xv = _mm256_loadu_ps(x + i);
+        xv = _mm256_div_ps(xv, _mm256_set1_ps(amax));
         acc = _mm256_fmadd_ps(xv, xv, acc);
     }
-    float norm2 = hsum8_ps(acc);
+    float normy2 = 0.0f;
+    {
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        normy2 = _mm_cvtss_f32(s);
+    }
     for (; i < len; ++i)
-        norm2 += x[i] * x[i];
+    {
+        const float yi = x[i] / amax;
+        normy2 += yi * yi;
+    }
 
-    float alpha = x[0];
-    float sigma = norm2 - alpha * alpha;
+    float sigma = normy2 - alpha * alpha; /* sum(y^2) - y0^2 */
     if (sigma <= 0.0f)
     {
         v[0] = 1.0f;
         for (uint16_t t = 1; t < len; ++t)
             v[t] = 0.0f;
+        x[0] = -x[0]; /* keep contract "x[0] = -beta" (beta=|x0|) */
         return 0.0f;
     }
 
-    float normx = sqrtf(alpha * alpha + sigma);
-    float beta = (alpha <= 0.0f) ? (alpha - normx) : (-sigma / (alpha + normx));
-    float tau = (2.0f * beta * beta) / (sigma + beta * beta);
+    /* normx = amax * ||y|| */
+    float normy = sqrtf(alpha * alpha + sigma);
+    float beta_scaled = (alpha <= 0.0f) ? (alpha - normy)
+                                        : (-sigma / (alpha + normy));
+    float beta = beta_scaled * amax; /* rescale */
 
+    /* tau = 2 / (1 + (sigma / beta_scaled^2))  (same as 2*β^2/(σ+β^2)) */
+    float tau = (2.0f * beta_scaled * beta_scaled) / (sigma + beta_scaled * beta_scaled);
+
+    /* v */
     v[0] = 1.0f;
     for (uint16_t t = 1; t < len; ++t)
         v[t] = x[t] / beta;
