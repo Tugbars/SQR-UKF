@@ -10,7 +10,29 @@
 #include "linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs
 // also exports mul(), inv() that qr_scalar uses
 
-/* ---------------- small scalar QR (original path, tidied) ---------------- */
+/**
+ * @brief Scalar (reference) QR decomposition via Householder reflections.
+ *
+ * @details
+ *  Computes the QR factorization of A (m×n) using classical Householder
+ *  reflectors in single precision. Produces R in upper-triangular form and,
+ *  unless @p only_R is true, forms Q explicitly by accumulating reflectors
+ *  and then inverting the product (Q = H₀H₁…H_{l-1}). This path is intended
+ *  for small matrices or as a portable fallback when SIMD is unavailable.
+ *
+ * @param[in]  A       Input matrix (m×n), row-major.
+ * @param[out] Q       Output orthogonal matrix (m×m). Ignored if @p only_R=true.
+ * @param[out] R       Output upper-triangular factor (m×n).
+ * @param[in]  m       Number of rows of A.
+ * @param[in]  n       Number of columns of A.
+ * @param[in]  only_R  If true, compute only R (skip forming Q).
+ *
+ * @retval 0          Success.
+ * @retval -ENOMEM    Allocation failure for temporaries.
+ *
+ * @warning Q and R must not alias A. All buffers must be valid and sized.
+ * @note Uses mul() and inv() from linalg_simd.h for dense ops in the scalar path.
+ */
 static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
                      float *RESTRICT R, uint16_t m, uint16_t n, bool only_R)
 {
@@ -117,6 +139,14 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
 #if LINALG_SIMD_ENABLE
 /* ---------------- AVX helpers (compiled only with AVX2/FMA) ---------------- */
 
+/**
+ * @brief Horizontal sum of 8 packed single-precision floats.
+ *
+ * @param[in] v   __m256 containing 8 lanes to sum.
+ * @return Sum of all 8 lanes as a scalar float.
+ *
+ * @note Helper for AVX2 accumulation; not exported.
+ */
 static inline float hsum8_ps(__m256 v)
 {
     __m128 lo = _mm256_castps256_ps128(v);
@@ -127,15 +157,40 @@ static inline float hsum8_ps(__m256 v)
     return _mm_cvtss_f32(s);
 }
 
+/**
+ * @brief Broadcast the selected 32-bit lane of a packed 8-float vector to all lanes.
+ *
+ * @param[in] pack  Source packed vector.
+ * @param[in] lane  Lane index (0..7) to broadcast.
+ * @return __m256 with all lanes equal to pack[lane].
+ *
+ * @note Helper for AVX2 lane manipulation; not exported.
+ */
 static inline __m256 bcast_lane(__m256 pack, int lane)
 {
     const __m256i idx = _mm256_set1_epi32(lane);
     return _mm256_permutevar8x32_ps(pack, idx);
 }
 
-/* Robust Householder: scales by max|x| to avoid overflow/underflow.
-   Returns tau; writes v (v[0]=1, v[1:]=x/beta); sets x[0] = -beta.
-   Same signature, drop-in. */
+/**
+ * @brief Robust Householder vector construction (AVX2-assisted).
+ *
+ * @details
+ *  Builds a numerically stable Householder reflector for the vector x of length
+ *  @p len using scaling by max |x| to avoid overflow/underflow. On return:
+ *   - v[0] = 1, v[1:] = x[1:]/β
+ *   - x[0] = -β (β has the sign chosen to reduce cancellation)
+ *   - Returns τ = 2 / (1 + σ/β²) (the standard Householder scalar)
+ *
+ * @param[out] v     Output Householder vector (length @p len).
+ * @param[in,out] x  On input: target vector segment; on output: x[0] = -β.
+ * @param[in]  len   Length of the vector segment.
+ *
+ * @return τ (tau) scaling for the reflector; returns 0 when x is (near) zero.
+ *
+ * @note Uses AVX2 to compute max norm and squared norm; has scalar tails.
+ * @warning v and x must reference valid buffers of length at least @p len.
+ */
 static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t len)
 {
     if (len == 0)
@@ -230,13 +285,25 @@ static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t 
     return tau;
 }
 
-/* ---------------- left apply (AVX2): Rk -= v * (tau * v^T * Rk) ----------------
-   Rk:  top-left of trailing block (points to R[k,k]), size len x nc, row-major, ld = n
-   v:   Householder vector of length 'len', with v[0] = 1
-   tau: scalar
-   nc:  number of cols in trailing block
-   Blocking: rows by Jc=LINALG_BLOCK_JC, cols by Kc=LINALG_BLOCK_KC.
-*/
+/**
+ * @brief Apply a Householder reflector from the left to a trailing block (AVX2, blocked).
+ *
+ * @details
+ *  Computes Rk ← Rk − v (τ vᵀ Rk), where Rk points to the top-left of the
+ *  trailing block (R[k:,k:]) with leading dimension @p ld and width @p nc.
+ *  The update is carried out in row/column tiles to improve cache locality.
+ *
+ * @param[in,out] Rk   Pointer to R[k,k] (row-major), updated in place.
+ * @param[in]     ld   Leading dimension of R (number of columns n).
+ * @param[in]     v    Householder vector of length @p len (v[0]=1).
+ * @param[in]     len  Number of rows in the trailing block (m-k).
+ * @param[in]     tau  Householder scalar τ.
+ * @param[in]     nc   Number of columns in the trailing block (n-k).
+ *
+ * @note Temporarily allocates a workspace t[0..nc-1] (aligned).
+ * @warning Returns silently if workspace allocation fails. Caller should ensure
+ *          Rk has room for (len×nc) elements from the given pointer/ld.
+ */
 static void apply_reflector_left_blocked_avx(float *RESTRICT Rk, uint16_t ld,
                                              const float *RESTRICT v, uint16_t len,
                                              float tau, uint16_t nc)
@@ -453,9 +520,24 @@ static void apply_reflector_left_blocked_avx(float *RESTRICT Rk, uint16_t ld,
     linalg_aligned_free(t);
 }
 
-/* ---------------- right apply on Q (AVX2) ----------------
-   Q[:,k:] -= (tau * Q[:,k:] * v) * v^T
-   Vectorizes both dot (per row) and rank-1 update. Falls back to scalar if AVX2 off. */
+/**
+ * @brief Apply a Householder reflector to Q from the right (AVX2).
+ *
+ * @details
+ *  Updates Q[:,k:] ← Q[:,k:] − (τ Q[:,k:] v) vᵀ, where v has length @p len
+ *  and @p k is the starting column. Uses AVX2 for both the row-wise dot product
+ *  (Q[:,k:] * v) and the subsequent rank-1 update.
+ *
+ * @param[in,out] Q    Orthogonal accumulator (m×m), updated in place.
+ * @param[in]     m    Order of Q (rows == cols).
+ * @param[in]     k    Starting column index for the trailing block.
+ * @param[in]     v    Householder vector (length @p len, v[0]=1).
+ * @param[in]     len  Number of columns in the trailing block (m-k).
+ * @param[in]     tau  Householder scalar τ.
+ *
+ * @note Allocates a temporary y[0..m-1] (aligned) for the intermediate product.
+ * @warning No bounds checks; caller guarantees valid ranges (k+len ≤ m).
+ */
 static void apply_reflector_right_Q_avx(float *RESTRICT Q, uint16_t m,
                                         uint16_t k,
                                         const float *RESTRICT v, uint16_t len,
@@ -515,8 +597,22 @@ static void apply_reflector_right_Q_avx(float *RESTRICT Q, uint16_t m,
 }
 #endif /* LINALG_SIMD_ENABLE */
 
-/* Apply reflector to Q on the right (scalar, simple & correct). */
-
+/**
+ * @brief Apply a Householder reflector to Q from the right (scalar fallback).
+ *
+ * @details
+ *  Scalar equivalent of apply_reflector_right_Q_avx(). Computes y = τ Q[:,k:] v
+ *  and applies the rank-1 update Q[:,k:] -= y vᵀ using simple loops.
+ *
+ * @param[in,out] Q    Orthogonal accumulator (m×m), updated in place.
+ * @param[in]     m    Order of Q (rows == cols).
+ * @param[in]     k    Starting column index for the trailing block.
+ * @param[in]     v    Householder vector (length @p len, v[0]=1).
+ * @param[in]     len  Number of columns in the trailing block (m-k).
+ * @param[in]     tau  Householder scalar τ.
+ *
+ * @note Used when LINALG_SIMD_ENABLE is false at build time.
+ */
 #if !LINALG_SIMD_ENABLE
 static void apply_reflector_right_Q_scalar(float *RESTRICT Q, uint16_t m,
                                            uint16_t k,
@@ -552,8 +648,32 @@ static void apply_reflector_right_Q_scalar(float *RESTRICT Q, uint16_t m,
 #endif
 
 /**
- * @brief      Single-precision QR decomposition via Householder reflections.
- *             Vectorized path uses blocked AVX2/FMA; tiny or non-AVX falls back to scalar.
+ * @brief Single-precision QR decomposition via Householder reflections.
+ *
+ * @details
+ *  Computes the QR factorization of A (m×n), producing R (upper-triangular).
+ *  If @p only_R is false, also forms Q explicitly. The implementation chooses
+ *  between a blocked AVX2/FMA path and a scalar reference path:
+ *   - **Vectorized path**: Robust Householder vector generation, blocked left
+ *     application on R, and right application on Q (if requested). Tuned with
+ *     LINALG_BLOCK_{JC,KC} for cache residency and uses aligned workspaces.
+ *   - **Scalar path**: Portable, small-matrix implementation that constructs
+ *     reflectors and multiplies them using mul()/inv() helpers.
+ *
+ * @param[in]  A       Input matrix (m×n), row-major.
+ * @param[out] Q       Output orthogonal matrix (m×m). Ignored if @p only_R=true.
+ * @param[out] R       Output upper-triangular factor (m×n).
+ * @param[in]  m       Number of rows of A.
+ * @param[in]  n       Number of columns of A.
+ * @param[in]  only_R  If true, compute only R (skip forming Q).
+ *
+ * @retval 0          Success.
+ * @retval -EINVAL    Invalid sizes (m==0 or n==0).
+ * @retval -ENOMEM    Allocation failure for temporary buffers (vector path).
+ *
+ * @warning Q and R must not alias A. Buffers must be valid and sized.
+ * @note The vector path is selected when AVX2 is available and the problem
+ *       is large enough (mn ≥ LINALG_SMALL_N_THRESH).
  */
 int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
        uint16_t m, uint16_t n, bool only_R)
