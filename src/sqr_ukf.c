@@ -648,42 +648,6 @@ static void multiply_sigma_point_matrix_to_weights(float x[],
 #endif
 }
 
-static void cholupdate_upper(float *U, const float *x, uint16_t n, bool update)
-{
-    float *y = (float *)ukf_aligned_alloc(32, (size_t)n * sizeof(float));
-    if (!y)
-        return;
-    for (uint16_t i = 0; i < n; ++i)
-        y[i] = x[i];
-
-    const float sgn = update ? 1.0f : -1.0f;
-
-    for (uint16_t k = 0; k < n; ++k)
-    {
-        float Ukk = U[(size_t)k * n + k];
-        float r = hypotf(Ukk, sgn * y[k]);
-        if (!(r > 0.0f) || !isfinite(r))
-        {
-            ukf_aligned_free(y);
-            return;
-        }
-
-        float c = r / Ukk;
-        float s = (sgn * y[k]) / Ukk;
-
-        U[(size_t)k * n + k] = r;
-
-        for (uint16_t j = (uint16_t)(k + 1); j < n; ++j)
-        {
-            float Ukj = U[(size_t)k * n + j];
-            float yj = y[j];
-            U[(size_t)k * n + j] = (Ukj + s * yj) / c;
-            y[j] = c * yj - s * Ukj;
-        }
-    }
-    ukf_aligned_free(y);
-}
-
 /**
  * @brief Build square-root state covariance S (SR-UKF) via QR of weighted deviations.
  *
@@ -878,8 +842,12 @@ static int create_state_estimation_error_covariance_matrix(float S[],
     /* Copy the upper L×L block of R_ into S (upper-triangular SR) */
     memcpy(S, R_, (size_t)L * L * sizeof(float));
 
-    /* Rank-1 update/downdate in **upper** convention with mean deviation b */
-    cholupdate_upper(/*U=*/S, /*x=*/(const float *)b, /*n=*/(uint16_t)L, /*update=*/(W[0] >= 0.0f));
+    int rc = cholupdate(/*L=*/S, /*x=*/(const float *)b, /*n=*/(uint16_t)L,
+                    /*is_upper=*/true, /*rank_one_update=*/(W[0] >= 0.0f));
+    if (rc != 0) {
+        /* SR covariance update failed (should be rare for prediction step) */
+        return rc;  /* propagate error (-EDOM or -ENOMEM) */
+    }
 
     /* Simple SPD sanity check: diagonal elements must be positive and finite */
     for (size_t i = 0; i < L; ++i)
@@ -1462,17 +1430,28 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     if (mul(U, Z /*K*/, Sy, n, n, n, n) != 0)
         return -EIO;
 
-    /* Downdate S (upper) by each column of U: S ← cholupdate_upper(S, U[:,j], false) */
+    /* Downdate S (upper) by each column of U */
     for (uint16_t j = 0; j < n; ++j)
     {
+        /* Prefetch next column (optional) */
         if (do_pf && (uint16_t)(j + 1) < n)
             _mm_prefetch((const char *)(&U[(size_t)0 * n + (j + 1)]), _MM_HINT_T0);
 
-        /* Extract column j of U into a contiguous vector (no gathers needed) */
+        /* Extract column j of U into contiguous vector */
         for (uint16_t i = 0; i < n; ++i)
             Uk[i] = U[(size_t)i * n + j];
 
-        cholupdate_upper(S, Uk, n, /*update=*/false);
+        /* Downdate S with column j */
+        int rc = cholupdate(S, Uk, n, /*is_upper=*/true, /*rank_one_update=*/false);
+        if (rc != 0)
+        {
+            /* Downdate failed: measurement update caused filter divergence.
+            This can happen if:
+            - Measurement is wildly inconsistent (outlier)
+            - R is too small (overconfident measurement model)
+            - Numerical issues accumulated                              */
+            return rc;  /* Let caller handle divergence */
+        }
     }
 
     return 0;

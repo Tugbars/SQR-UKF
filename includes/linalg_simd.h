@@ -228,8 +228,12 @@ int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
  * @param[in]     row            Dimension.
  * @param[in]     rank_one_update  true=update, false=downdate.
  */
-void cholupdate(float *RESTRICT L, const float *RESTRICT x,
-                uint16_t row, bool rank_one_update);
+
+int cholupdate(float *RESTRICT L,
+               const float *RESTRICT x,
+               uint16_t n,
+               bool is_upper,
+               bool rank_one_update);
 
 /* =====================================================================
  *                       Notes on usage and aliasing
