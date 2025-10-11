@@ -4,23 +4,12 @@
 #include <string.h>
 #include <math.h>
 #include <immintrin.h>
-#include "linalg_simd.h" 
+#include "linalg_simd.h"
 
-#ifndef RESTRICT
-#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
-#    define RESTRICT restrict
-#  else
-#    define RESTRICT
-#  endif
+/* Use the library's small-n threshold for the AVX crossover. */
+#ifndef AVX_MIN_N
+#  define AVX_MIN_N  LINALG_SMALL_N_THRESH
 #endif
-
-static inline int has_avx2(void) {
-#if defined(__AVX2__) && defined(__FMA__)
-    return 1;
-#else
-    return 0;
-#endif
-}
 
 /*
  * cholupdate (no transpose):
@@ -35,166 +24,166 @@ static inline int has_avx2(void) {
  *  - AVX2 path: gathers for strided column elements, contiguous loads/stores for x.
  *  - Unrolled k-loop (2×8) + prefetch to better hide gather latency.
  */
-void cholupdate(float *RESTRICT L, const float *RESTRICT xx, uint16_t n, bool rank_one_update)
+void cholupdate(float *RESTRICT L, const float *RESTRICT x_in,
+                uint16_t row16, bool rank_one_update)
 {
-    if (n == 0) return;
+    if (row16 == 0)
+        return;
+    const uint32_t n = (uint32_t)row16;
 
-    /* working copy of x (modified in-place) */
-    float *x = (float*)malloc((size_t)n * sizeof(float));
-    if (!x) return;
-    memcpy(x, xx, (size_t)n * sizeof(float));
+    /* 32B-aligned working copy of x (hot write-backs). */
+    float *x = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)n * sizeof(float));
+    if (!x)
+        return;
+    memcpy(x, x_in, (size_t)n * sizeof(float));
 
     const float sign = rank_one_update ? 1.0f : -1.0f;
 
-    if (has_avx2() && n >= 8) {
-        /* gather index pattern for stride = n: {0, n, 2n, ..., 7n} */
+#if LINALG_SIMD_ENABLE
+    const int use_avx = linalg_has_avx2() && n >= (uint32_t)AVX_MIN_N;
+#else
+    const int use_avx = 0;
+#endif
+
+#if LINALG_SIMD_ENABLE
+    if (use_avx)
+    {
+        /* gather index pattern for stride n: {0, n, 2n, ..., 7n} */
         alignas(32) int idx_step[8];
-        for (int t = 0; t < 8; ++t) idx_step[t] = t * (int)n;
-        const __m256i gidx = _mm256_load_si256((const __m256i*)idx_step);
+        for (int t = 0; t < 8; ++t)
+            idx_step[t] = t * (int)n;
+        const __m256i gidx = _mm256_load_si256((const __m256i *)idx_step);
 
-        /* prefetch distance (in rows) for the strided column + x-vector */
-        const int PF_ROWS = 32;  /* tuneable: 16..64 sensible */
+        const uint32_t PF_ROWS = 32; /* tune per µarch */
 
-        for (uint16_t i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < n; ++i)
+        {
             const size_t di = (size_t)i * n + i;
-            const float  Lii = L[di];
-            const float  xi  = x[i];
+            const float Lii = L[di];
+            const float xi = x[i];
 
-            /* Compute rotation (update/downdate) */
-            const float r2 = Lii*Lii + sign * xi*xi;
-            const float r  = sqrtf(r2);
-            const float c  = r / Lii;
-            const float s  = (Lii != 0.0f) ? (xi / Lii) : 0.0f;
+            /* Cheaper diagonal math (1 divide): t=xi/Lii; c=sqrt(1+sign*t^2); r=c*Lii */
+            const float t = (Lii != 0.0f) ? (xi / Lii) : 0.0f;
+            const float r2 = 1.0f + sign * t * t;
 
-            /* Update diagonal */
-            L[di] = r;
-
-            /* If xi==0, column i below diagonal and x[k] are unchanged except for the next columns;
-               we can early-out the heavy work for this column. */
-            if (xi == 0.0f) {
-                continue;
+            /* PD guard for downdate (and safety in general) */
+            if (r2 <= 0.0f)
+            {
+                linalg_aligned_free(x);
+                return; /* early exit; L is valid up to previous columns */
             }
 
-            /* Broadcast constants */
-            const __m256 c_v     = _mm256_set1_ps(c);
-            const __m256 invc_v  = _mm256_set1_ps(1.0f / c);
-            const __m256 s_v     = _mm256_set1_ps(s);
-            const __m256 ss_v    = _mm256_set1_ps(sign * s);
-
-            /* Update column i below the diagonal: k = i+1..n-1
-               Unroll by 16 rows = 2×(8-row) AVX blocks to overlap gathers. */
-            uint16_t k = (uint16_t)(i + 1);
-
-            for (; (uint16_t)(k + 15) < n; k = (uint16_t)(k + 16)) {
-                /* Prefetch a bit ahead on x and column-L memory to hide latency */
-                const uint16_t kpf = (uint16_t)(k + PF_ROWS);
-                if (kpf < n) {
-                    _mm_prefetch((const char*)(&x[kpf]), _MM_HINT_T0);
-                    /* prefetch strided column: take one base and hope HW prefetch helps */
-                    const float *pfL = &L[(size_t)kpf * n + i];
-                    _mm_prefetch((const char*)(pfL), _MM_HINT_T0);
-                }
-
-                /* ----- Block 0: rows k..k+7 ----- */
-                float *baseL0 = &L[(size_t)k * n + i];
-                __m256 Lik0 = _mm256_i32gather_ps(baseL0, gidx, sizeof(float));
-                __m256 xk0  = _mm256_loadu_ps(&x[k]);
-
-                __m256 Lik0_new = _mm256_mul_ps(_mm256_add_ps(Lik0, _mm256_mul_ps(ss_v, xk0)), invc_v);
-                __m256 xk0_new  = _mm256_fnmadd_ps(s_v, Lik0, _mm256_mul_ps(c_v, xk0));
-
-                /* store x[k..k+7] */
-                _mm256_storeu_ps(&x[k], xk0_new);
-
-                /* scatter back Lik0_new via scalar stores */
-                alignas(32) float buf0[8];
-                _mm256_store_ps(buf0, Lik0_new);
-                for (int t = 0; t < 8; ++t)
-                    baseL0[(size_t)t * n] = buf0[t];
-
-                /* ----- Block 1: rows k+8..k+15 ----- */
-                float *baseL1 = &L[(size_t)(k + 8) * n + i];
-                __m256 Lik1 = _mm256_i32gather_ps(baseL1, gidx, sizeof(float));
-                __m256 xk1  = _mm256_loadu_ps(&x[k + 8]);
-
-                __m256 Lik1_new = _mm256_mul_ps(_mm256_add_ps(Lik1, _mm256_mul_ps(ss_v, xk1)), invc_v);
-                __m256 xk1_new  = _mm256_fnmadd_ps(s_v, Lik1, _mm256_mul_ps(c_v, xk1));
-
-                _mm256_storeu_ps(&x[k + 8], xk1_new);
-
-                alignas(32) float buf1[8];
-                _mm256_store_ps(buf1, Lik1_new);
-                for (int t = 0; t < 8; ++t)
-                    baseL1[(size_t)t * n] = buf1[t];
-            }
-
-            /* 8-row AVX remainder */
-            for (; (uint16_t)(k + 7) < n; k = (uint16_t)(k + 8)) {
-                /* Optional prefetch */
-                const uint16_t kpf = (uint16_t)(k + PF_ROWS);
-                if (kpf < n) {
-                    _mm_prefetch((const char*)(&x[kpf]), _MM_HINT_T0);
-                    const float *pfL = &L[(size_t)kpf * n + i];
-                    _mm_prefetch((const char*)(pfL), _MM_HINT_T0);
-                }
-
-                float *baseL = &L[(size_t)k * n + i];
-                __m256 Lik = _mm256_i32gather_ps(baseL, gidx, sizeof(float));
-                __m256 xk  = _mm256_loadu_ps(&x[k]);
-
-                __m256 Lik_new = _mm256_mul_ps(_mm256_add_ps(Lik, _mm256_mul_ps(ss_v, xk)), invc_v);
-                __m256 xk_new  = _mm256_fnmadd_ps(s_v, Lik, _mm256_mul_ps(c_v, xk));
-
-                _mm256_storeu_ps(&x[k], xk_new);
-
-                alignas(32) float tmp[8];
-                _mm256_store_ps(tmp, Lik_new);
-                for (int t = 0; t < 8; ++t)
-                    baseL[(size_t)t * n] = tmp[t];
-            }
-
-            /* scalar tail */
-            for (; k < n; ++k) {
-                const size_t off = (size_t)k * n + i;
-                const float  Lik = L[off];
-                const float  xk  = x[k];
-                const float  Lik_new = (Lik + sign * s * xk) / c;
-                const float  xk_new  =  c * xk - s * Lik;
-                L[off] = Lik_new;
-                x[k]   = xk_new;
-            }
-        }
-    } else {
-        /* scalar fallback */
-        for (uint16_t i = 0; i < n; ++i) {
-            const size_t di = (size_t)i * n + i;
-            const float  Lii = L[di];
-            const float  xi  = x[i];
-
-            const float r2 = Lii*Lii + sign * xi*xi;
-            const float r  = sqrtf(r2);
-            const float c  = r / Lii;
-            const float s  = (Lii != 0.0f) ? (xi / Lii) : 0.0f;
+            const float c = sqrtf(r2);
+            const float r = c * Lii;
+            const float s = t;
 
             L[di] = r;
 
-            if (xi == 0.0f) continue;
+            /* Warm the first touches of column i+1 (row-major stride-n defeats HW prefetch). */
+            if (i + 1 < n)
+            {
+                const char *next_col = (const char *)&L[((size_t)(i + 1)) * n + (i + 1)];
+                _mm_prefetch(next_col + 0 * 64, _MM_HINT_T1);
+                _mm_prefetch(next_col + 1 * 64, _MM_HINT_T1);
+            }
 
-            for (uint16_t k = (uint16_t)(i + 1); k < n; ++k) {
+            if (xi == 0.0f)
+                continue; /* predictable skip */
+
+            const __m256 c_v = _mm256_set1_ps(c);
+            const __m256 invc_v = _mm256_set1_ps(1.0f / c);
+            const __m256 s_v = _mm256_set1_ps(s);
+            const __m256 ss_v = _mm256_set1_ps(sign * s);
+
+            uint32_t k = i + 1;
+
+            /* --- peel until k is 8-aligned (so &x[k] is 32B aligned) --- */
+            while ((k < n) && (k & 7)) {
                 const size_t off = (size_t)k * n + i;
                 const float  Lik = L[off];
                 const float  xk  = x[k];
                 L[off] = (Lik + sign * s * xk) / c;
                 x[k]   =  c * xk - s * Lik;
+                ++k;
             }
+
+            /* Single 8-lane AVX block; scalar tail. */
+            for (; k + 7 < n; k += 8)
+            {
+                const uint32_t kpf = k + PF_ROWS;
+                if (kpf < n)
+                {
+                    _mm_prefetch((const char *)(&x[kpf]), _MM_HINT_T0);
+                    const float *pfL = &L[(size_t)kpf * n + i];
+                    _mm_prefetch((const char *)(pfL), _MM_HINT_T0);
+                }
+
+                float *baseL = &L[(size_t)k * n + i];
+                __m256 Lik = _mm256_i32gather_ps(baseL, gidx, sizeof(float));
+                 /* x is 32B-aligned and k % 8 == 0 after the peel → aligned load/store */
+                __m256 xk = _mm256_load_ps(&x[k]); 
+
+                /* Lik_new = (Lik + sign*s*xk) / c */
+                __m256 Lik_new = _mm256_mul_ps(_mm256_fmadd_ps(ss_v, xk, Lik), invc_v);
+                /* xk_new  =  c*xk - s*Lik  =>  -(s*Lik) + c*xk */
+                __m256 xk_new = _mm256_fnmadd_ps(s_v, Lik, _mm256_mul_ps(c_v, xk));
+
+                _mm256_store_ps(&x[k], xk_new);
+
+                /* Scatter via small scalar loop sourced from a vector store. */
+                alignas(32) float buf[8];
+                _mm256_store_ps(buf, Lik_new);
+                for (int t = 0; t < 8; ++t)
+                    baseL[(size_t)t * n] = buf[t];
+            }
+
+            for (; k < n; ++k)
+            {
+                const size_t off = (size_t)k * n + i;
+                const float Lik = L[off];
+                const float xk = x[k];
+                L[off] = (Lik + sign * s * xk) / c;
+                x[k] = c * xk - s * Lik;
+            }
+        }
+
+        linalg_aligned_free(x);
+        return;
+    }
+#endif /* LINALG_SIMD_ENABLE */
+
+    /* -------- scalar fallback -------- */
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const size_t di = (size_t)i * n + i;
+        const float Lii = L[di];
+        const float xi = x[i];
+
+        const float t = (Lii != 0.0f) ? (xi / Lii) : 0.0f;
+        const float r2 = 1.0f + sign * t * t;
+        if (r2 <= 0.0f)
+        {
+            linalg_aligned_free(x);
+            return;
+        }
+        const float c = sqrtf(r2);
+        const float r = c * Lii;
+        const float s = t;
+
+        L[di] = r;
+
+        if (xi == 0.0f)
+            continue;
+
+        for (uint32_t k = i + 1; k < n; ++k)
+        {
+            const size_t off = (size_t)k * n + i;
+            const float Lik = L[off];
+            const float xk = x[k];
+            L[off] = (Lik + sign * s * xk) / c;
+            x[k] = c * xk - s * Lik;
         }
     }
 
-    free(x);
+    linalg_aligned_free(x);
 }
-
-/*
-Prefetching:
-
-The single prefetch for L relies on hardware prefetching, which may miss strided accesses. Prefetching could be extended to the scalar path.
-*/
