@@ -3,9 +3,9 @@
 /*
 Cache-aware 3-level blocking (Mc/Kc/Nc) with reasonable defaults that keep L2/L3 pressure low.
 Two NR (6 & 8) and two MR (8 & 16) shapes so the hot inner loops are always 8- or 16-wide on the M dimension and 6/8-wide on N—exactly the sweet spot for AVX2.
-AVX2 FMA micro-kernels are unrolled 8× in K (8 FMAs per cycle per accumulator bundle) and use broadcast-loads – you’re hitting the pipeline hard without register spills.
+AVX2 FMA micro-kernels are unrolled 8× in K (8 FMAs per cycle per accumulator bundle) and use broadcast-loads  hitting the pipeline hard without register spills.
 Proper software prefetching (short and long distance, A and B streams, optional L2 bypass) and it’s all compile-time toggles.
-Aligned packing buffers (32 B) and optional non-temporal stores for the write-back path – you clearly measured bandwidth.
+Aligned packing buffers (32 B) and optional non-temporal stores for the write-back pat
 Tail handling is vectorised with masked loads/stores instead of scalar fall-back.
 In-register 8×8 transpose for the 16×8/8×8 kernels avoids extra memory shuffles when C is row-major.
 Small-M/N short-circuit to a scalar path avoids the call overhead when the problem is tiny.
