@@ -1,30 +1,32 @@
-// SPDX-License-Identifier: MIT
 /**
  * @file cholupdatek.c
- * @brief Rank-k Cholesky update/downdate (single-precision), tiled + AVX2.
+ * @brief Rank-k Cholesky update and downdate routines with tiled and BLAS-3 variants.
  *
  * @details
- * Updates a Cholesky factor L (lower or upper) in place so that:
- *   - update   (add>0):  L Lᵀ  ←  L Lᵀ  + X Xᵀ
- *   - downdate (add<0):  L Lᵀ  ←  L Lᵀ  − X Xᵀ
- * where X is n×k (row-major).  Numerical core is the robust Givens-style rank-1
- * update used in high-quality implementations; we apply it k times but in
- * **cache-tiled batches** to improve locality. AVX2 kernels are used for the
- * row updates when available (same intrinsics style as your existing code).
+ * This module provides both a tiled AVX2-optimized and a BLAS-3 QR-based
+ * implementation of rank-k Cholesky updates and downdates.
  *
- * Public API:
- *   int cholupdatek(float *L, const float *X, uint16_t n, uint16_t k,
- *                   bool is_upper, int add);
- *   int cholupdate (float *L, const float *x, uint16_t n,
- *                   bool is_upper, bool rank_one_update); // wrapper
+ * It supports both lower and upper triangular factors, updating them in-place:
+ * \f[
+ *    L L^T \leftarrow L L^T \pm X X^T
+ * \f]
+ * where the sign depends on the `add` parameter.
  *
- * Notes:
- *  - Row-major storage.
- *  - On downdate, if positivity would be violated, returns -EDOM and leaves L
- *    valid for the portion already processed.
- *  - This version is “BLAS-3 viable”: work is batched over a column-tile of X,
- *    minimizing streaming of L/x. When/if you want a full TRSM+SYRK/GEMM block
- *    algorithm, we can swap the inner loop without changing the API.
+ * Functions in this file are used in covariance maintenance, Kalman filtering,
+ * and numerical optimization algorithms where maintaining a Cholesky factor
+ * is cheaper and more stable than refactoring the full matrix.
+ *
+ * ### Provided interfaces:
+ * - `cholupdate_rank1_core()` — internal Givens-style single-vector update.
+ * - `cholupdatek()` — tiled rank-k update (cache-friendly, AVX2-accelerated).
+ * - `cholupdatek_blockqr()` — BLAS-3 blocked QR algorithm (compact-WY based).
+ * - `cholupdatek_blas3()` — high-level dispatcher that chooses the best path.
+ *
+ * ### Key properties:
+ * - Handles both upper and lower triangular Cholesky factors.
+ * - Supports downdates (negative updates) safely with SPD validation.
+ * - SIMD vectorized with AVX2 for fast rank-1 operations.
+ * - Fully BLAS-3 capable when used with blocked QR kernels.
  */
 
 #include <stdint.h>
@@ -34,7 +36,6 @@
 #include <math.h>
 #include <immintrin.h>
 #include "linalg_simd.h"
-#include "qr.h"
 
 #ifndef CHOLK_COL_TILE
 #define CHOLK_COL_TILE 32 /* columns of X per batch (try 32–128) */
@@ -44,9 +45,31 @@
 #define CHOLK_AVX_MIN_N LINALG_SMALL_N_THRESH
 #endif
 
-/* ==== Robust rank-1 kernel (the one you already have, slightly factored) ==== */
-/* Applies one vector x (length n) to in-place L, lower/upper, update (add=+1) or downdate (add=-1).
-   x is both input and work buffer (modified). Returns 0 or -EDOM on SPD violation. */
+/**
+ * @brief Internal robust rank-1 Cholesky update/downdate kernel.
+ *
+ * @details
+ * Updates a Cholesky factor \f$L\f$ (lower or upper) in-place for a single vector `x`,
+ * performing the transformation:
+ * \f[
+ *    L L^T \leftarrow L L^T \pm x x^T
+ * \f]
+ * where the sign is determined by the `add` parameter.
+ *
+ * Uses a Givens-style rotation method, which is numerically stable for both
+ * updates and downdates. AVX2 vectorization is applied to the row update loop
+ * for large matrices to improve throughput.
+ *
+ * This is the fundamental primitive used by the tiled rank-k update.
+ *
+ * @param[in,out] L        Pointer to in-place Cholesky factor (n×n, row-major).
+ * @param[in,out] x        Work vector (length n); modified during computation.
+ * @param[in]     n        Matrix dimension.
+ * @param[in]     is_upper True if `L` is upper-triangular, false if lower.
+ * @param[in]     add      +1 for update, -1 for downdate.
+ * @retval 0     Success.
+ * @retval -EDOM Downdate would destroy SPD (non-positive r2 detected).
+ */
 static int cholupdate_rank1_core(float *RESTRICT L,
                                  float *RESTRICT x, /* in/out work */
                                  uint16_t n,
@@ -174,7 +197,40 @@ static int cholupdate_rank1_core(float *RESTRICT L,
     return 0;
 }
 
-/* ==== Public rank-k API (tiled over columns of X) ==== */
+/**
+ * @brief Tiled rank-k Cholesky update/downdate with AVX2 acceleration.
+ *
+ * @details
+ * Extends the rank-1 core to handle a rank-k update by processing columns of
+ * \f$X\f$ in cache-friendly batches (`CHOLK_COL_TILE` wide). Each column is
+ * applied sequentially through the robust rank-1 update kernel.
+ *
+ * For example, when `add=+1`, performs:
+ * \f[
+ *    L L^T \leftarrow L L^T + X X^T
+ * \f]
+ * If `add=-1`, performs a downdate:
+ * \f[
+ *    L L^T \leftarrow L L^T - X X^T
+ * \f]
+ *
+ * AVX2 SIMD instructions are used inside each rank-1 update for the row updates.
+ * This version is optimized for moderate `n` and small to medium `k`.
+ *
+ * Used in numerical applications where updates to covariance matrices
+ * are frequent but re-factorization is too costly.
+ *
+ * @param[in,out] L        In-place Cholesky factor (lower or upper, n×n).
+ * @param[in]     X        Matrix of update vectors (n×k, row-major).
+ * @param[in]     n        Matrix dimension.
+ * @param[in]     k        Number of rank-1 updates to apply.
+ * @param[in]     is_upper True for upper-triangular, false for lower-triangular.
+ * @param[in]     add      +1 for update, -1 for downdate.
+ * @retval 0     Success.
+ * @retval -EDOM Downdate would break SPD.
+ * @retval -ENOMEM Allocation failure for temporary buffer.
+ * @retval -EINVAL Invalid arguments.
+ */
 int cholupdatek(float *RESTRICT L,
                 const float *RESTRICT X, /* n×k, row-major */
                 uint16_t n,
@@ -224,7 +280,19 @@ int cholupdatek(float *RESTRICT L,
     return 0;
 }
 
-/* ---- Utility: copy triangular (upper) block R11 out of a row-major R ---- */
+/**
+ * @brief Extracts the leading n×n upper-triangular block (R₁₁) from a QR result.
+ *
+ * @details
+ * Copies the upper-triangular portion of `Rsrc` into `Udst`, zeroing the
+ * elements below the diagonal. Used internally by `cholupdatek_blockqr`
+ * to extract the new Cholesky factor from the blocked QR factorization.
+ *
+ * @param[out] Udst Destination buffer for the upper-triangular block (n×n).
+ * @param[in]  Rsrc Source matrix (result of QR factorization, n×ldR).
+ * @param[in]  n    Dimension of the block to extract.
+ * @param[in]  ldR  Leading dimension of `Rsrc` (typically n+k).
+ */
 static void copy_upper_nxn_from_qr(float *RESTRICT Udst, const float *RESTRICT Rsrc,
                                    uint16_t n, uint16_t ldR)
 {
@@ -239,7 +307,47 @@ static void copy_upper_nxn_from_qr(float *RESTRICT Udst, const float *RESTRICT R
     }
 }
 
-/* ---- Public: BLAS-3 rank-k update/downdate via blocked QR ---- */
+/**
+ * @brief BLAS-3 rank-k Cholesky update/downdate using blocked QR.
+ *
+ * @details
+ * Implements a high-performance, numerically stable update based on the
+ * identity:
+ * \f[
+ *    A_{\text{new}} = A \pm X X^T = U^T U \pm X X^T
+ * \f]
+ * Construct
+ * \f[
+ *    M = [U \,|\, \sqrt{\text{sign}} X],
+ * \f]
+ * then compute its compact-WY QR factorization:
+ * \f[
+ *    M = Q R.
+ * \f]
+ * The new Cholesky factor is simply \f$U_{\text{new}} = R_{11}\f$.
+ *
+ * For lower-triangular inputs, we apply the same logic to \(U = L^T\)
+ * and transpose the result back.
+ *
+ * This formulation pushes all heavy work into your blocked QR routine,
+ * which internally uses GEMM-shaped operations — achieving full BLAS-3 efficiency.
+ *
+ * @param[in,out] L_or_U   In-place Cholesky factor (lower or upper, n×n).
+ * @param[in]     X        Update matrix (n×k, row-major).
+ * @param[in]     n        Matrix dimension.
+ * @param[in]     k        Number of columns in X (rank of the update).
+ * @param[in]     is_upper True if `L_or_U` is upper, false if lower.
+ * @param[in]     add      +1 for update, -1 for downdate.
+ * @retval 0      Success.
+ * @retval -ENOMEM Allocation failure.
+ * @retval -EINVAL Invalid arguments.
+ *
+ * @note
+ *  - Relies on `qrw_geqrf_blocked_wy()` (your blocked compact-WY QR).
+ *  - When downdating, if SPD is lost, the result may no longer represent a
+ *    valid Cholesky factor — caller should verify diagonal positivity.
+ *  - This is the **BLAS-3 path**; heavy computations are GEMM-optimized.
+ */
 int cholupdatek_blockqr(float *RESTRICT L_or_U,
                         const float *RESTRICT X, /* n×k */
                         uint16_t n, uint16_t k,
@@ -356,8 +464,28 @@ int cholupdatek_blockqr(float *RESTRICT L_or_U,
     return 0;
 }
 
-/* Optional convenience wrapper:
-   Use the blocked-QR BLAS-3 path if available, otherwise fall back to your tiled rank-1. */
+/**
+ * @brief Dispatcher for BLAS-3 Cholesky update; falls back to tiled path.
+ *
+ * @details
+ * Calls the blocked QR implementation (`cholupdatek_blockqr`) when available
+ * and numerically appropriate. If the QR path fails or is not supported,
+ * falls back to the tiled rank-1 update (`cholupdatek`).
+ *
+ * This function is the preferred public entry point for rank-k updates and
+ * downdates, automatically selecting the optimal algorithm.
+ *
+ * @param[in,out] L_or_U   In-place Cholesky factor (lower or upper, n×n).
+ * @param[in]     X        Update matrix (n×k, row-major).
+ * @param[in]     n        Matrix dimension.
+ * @param[in]     k        Rank of the update.
+ * @param[in]     is_upper True if `L_or_U` is upper, false if lower.
+ * @param[in]     add      +1 for update, -1 for downdate.
+ * @retval 0      Success.
+ * @retval -EDOM  SPD violation detected.
+ * @retval -ENOMEM Memory allocation failure.
+ * @retval -EINVAL Invalid arguments.
+ */
 int cholupdatek_blas3(float *RESTRICT L_or_U,
                       const float *RESTRICT X, uint16_t n, uint16_t k,
                       bool is_upper, int add)
