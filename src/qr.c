@@ -1,4 +1,61 @@
-// SPDX-License-Identifier: MIT
+/**
+ * @file
+ * @brief Blocked compact-WY QR (single-precision) with AVX2/FMA kernels.
+ *
+ * @details
+ * This implementation factors an m×n row-major matrix A into Q·R using
+ * Householder reflections. It follows the LAPACK/BLAS pattern:
+ *  - **Panel factorization (unblocked)**: GEQR2 over a panel of width @ref QRW_IB_DEFAULT.
+ *  - **Form T (compact-WY)**: LARFT builds the ib×ib triangular T for the panel V.
+ *  - **Blocked application to trailing matrix**: LARFB-style update via three BLAS-3 shaped
+ *    steps: Y = Vᵀ·C, Z = T·Y, C ← C − V·Z. These are implemented with small packers and
+ *    AVX2/FMA vectorized kernels (dual accumulators, contiguous loads across kc).
+ *
+ * **Data layout and outputs**
+ *  - Input is row-major A (m×n). The routine copies A→R and factors **in-place**.
+ *  - On return, the **upper triangle of R** is the R factor. The **strict lower triangle**
+ *    stores the Householder reflectors V; the corresponding scalars τ are kept internally.
+ *  - Q is **not** formed unless requested. When needed, ORGQR builds Q (m×m) using the same
+ *    blocked machinery (no per-reflector rank-1 updates).
+ *
+ * **Dispatch**
+ *  - For small problems (mn < @ref LINALG_SMALL_N_THRESH) or when AVX2 is unavailable,
+ *    a scalar reference QR path is used.
+ *  - Otherwise, the blocked compact-WY path is selected.
+ *
+ * **SIMD & alignment**
+ *  - AVX2/FMA kernels assume 32-byte alignment for workspace allocations
+ *    (enforced by linalg_aligned_alloc). Unaligned loads are used where layout
+ *    prohibits alignment guarantees (e.g., packed tiles), but hot buffers are aligned.
+ *
+ * **Tuning knobs**
+ *  - @ref QRW_IB_DEFAULT : Panel width (ib). Try 64–96 on Intel 14900KF.
+ *  - @ref LINALG_BLOCK_KC : Trailing-block tile width (kc) for packed updates, e.g., 256–320.
+ *  - @ref LINALG_SMALL_N_THRESH : Switch to scalar path for small mn.
+ *
+ * **API overview**
+ *  - `int qr(const float* A, float* Q, float* R, uint16_t m, uint16_t n, bool only_R);`
+ *      - Copies A→R, computes R and (optionally) Q.
+ *      - Returns 0 on success, negative errno on failure.
+ *  - Internal helpers: blocked GEQRF (in-place reflectors + τ), ORGQR (forms Q on demand),
+ *    tiny pack/unpack, and AVX2 kernels for Y/Z/VZ.
+ *  - Optional: a minimal CPQR (`geqp3_blocked`) is provided but not wired into `qr()`.
+ *
+ * **Numerics**
+ *  - Householder vectors use a robust constructor with scaling by ‖x‖∞ to avoid
+ *    overflow/underflow and Parlett’s choice for β to minimize cancellation.
+ *  - Compact-WY preserves the numerical stability of classical Householder QR while
+ *    improving performance via BLAS-3-like updates.
+ *
+ * @note  Single-precision build by default. Hooks exist to mirror s/d and add c/z variants.
+ * @note  This file is single-threaded by design; parallelization can be layered around
+ *        the GEMM-shaped updates if needed.
+ * @warning Q and R must not alias A. All buffers must be valid and sized.
+ * @warning The reflectors (V) overwrite the strict lower triangle of R; if you need A later,
+ *          keep your own copy.
+ *
+ */
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -7,31 +64,30 @@
 #include <errno.h>
 #include <immintrin.h>
 
-#include "linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs
+#include "linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs, linalg_aligned_alloc/free
 // also exports mul(), inv() that qr_scalar uses
 
-/**
- * @brief Scalar (reference) QR decomposition via Householder reflections.
- *
- * @details
- *  Computes the QR factorization of A (m×n) using classical Householder
- *  reflectors in single precision. Produces R in upper-triangular form and,
- *  unless @p only_R is true, forms Q explicitly by accumulating reflectors
- *  and then inverting the product (Q = H₀H₁…H_{l-1}). This path is intended
- *  for small matrices or as a portable fallback when SIMD is unavailable.
- *
- * @param[in]  A       Input matrix (m×n), row-major.
- * @param[out] Q       Output orthogonal matrix (m×m). Ignored if @p only_R=true.
- * @param[out] R       Output upper-triangular factor (m×n).
- * @param[in]  m       Number of rows of A.
- * @param[in]  n       Number of columns of A.
- * @param[in]  only_R  If true, compute only R (skip forming Q).
- *
- * @retval 0          Success.
- * @retval -ENOMEM    Allocation failure for temporaries.
- *
- * @warning Q and R must not alias A. All buffers must be valid and sized.
- * @note Uses mul() and inv() from linalg_simd.h for dense ops in the scalar path.
+#ifndef LINALG_SMALL_N_THRESH
+#define LINALG_SMALL_N_THRESH 48
+#endif
+
+#ifndef LINALG_BLOCK_KC
+#define LINALG_BLOCK_KC 256
+#endif
+
+#ifndef LINALG_BLOCK_JC
+#define LINALG_BLOCK_JC 64
+#endif
+
+#ifndef QRW_IB_DEFAULT
+#define QRW_IB_DEFAULT 64 // try 64 or 96 on 14900KF
+#endif
+
+_Static_assert(LINALG_DEFAULT_ALIGNMENT >= 32, "Need 32B alignment for AVX loads");
+
+/* ===========================================================================================
+ * Scalar (reference) QR (unchanged, small matrices or no-AVX fallback)
+ * ===========================================================================================
  */
 static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
                      float *RESTRICT R, uint16_t m, uint16_t n, bool only_R)
@@ -71,9 +127,13 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
         }
         s = sqrtf(s);
         float Rk = R[(size_t)k * n + k];
+        if (s == 0.0f)
+            continue; // guard: nothing to do on this column
         if (Rk < 0.0f)
             s = -s;
         float r = sqrtf(2.0f * s * (Rk + s));
+        if (r == 0.0f)
+            continue; // guard: avoid division by zero
 
         memset(W, 0, (size_t)m * sizeof(float));
         W[k] = (Rk + s) / r;
@@ -97,7 +157,6 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
 
     if (!only_R)
     {
-        // Avoid aliasing restrict parameters by using a temporary copy
         float *Hin = (float *)malloc((size_t)m * m * sizeof(float));
         if (!Hin)
         {
@@ -110,7 +169,6 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
             return -ENOMEM;
         }
         memcpy(Hin, H, (size_t)m * m * sizeof(float));
-
         int rc = inv(H, Hin, m); // separate input/output
         free(Hin);
         if (rc != 0)
@@ -123,7 +181,6 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
             free(HiR);
             return -ENOTSUP;
         }
-
         memcpy(Q, H, (size_t)m * m * sizeof(float));
     }
 
@@ -136,575 +193,690 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
     return 0;
 }
 
-#if LINALG_SIMD_ENABLE
-/* ---------------- AVX helpers (compiled only with AVX2/FMA) ---------------- */
-/**
- * @brief Horizontal sum of 8 packed single-precision floats.
- *
- * @param[in] v   __m256 containing 8 lanes to sum.
- * @return Sum of all 8 lanes as a scalar float.
- *
- * @note Uses shuffle-based reduction (3-4× faster than hadd on most CPUs).
+/* ===========================================================================================
+ * Blocked compact-WY QR (single precision; scalar + AVX2 kernels)
+ * ===========================================================================================
  */
-static inline float hsum8_ps(__m256 v)
-{
-    __m128 lo   = _mm256_castps256_ps128(v);      // Extract lower 128 bits
-    __m128 hi   = _mm256_extractf128_ps(v, 1);    // Extract upper 128 bits
-    __m128 s    = _mm_add_ps(lo, hi);             // 4 lanes → [a+e, b+f, c+g, d+h]
-    __m128 shuf = _mm_movehdup_ps(s);             // [b+f, b+f, d+h, d+h]
-    s = _mm_add_ps(s, shuf);                      // [a+e+b+f, *, c+g+d+h, *]
-    shuf = _mm_movehl_ps(shuf, s);                // [c+g+d+h, *]
-    s = _mm_add_ss(s, shuf);                      // [sum, *, *, *]
-    return _mm_cvtss_f32(s);
-}
 
-/**
- * @brief Horizontal maximum of 8 packed single-precision floats.
- *
- * @param[in] v   __m256 containing 8 lanes.
- * @return Maximum of all 8 lanes as a scalar float.
- *
- * @note Helper for AVX2 max reduction; not exported.
- */
-static inline float hmax8_ps(__m256 v)
-{
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 m  = _mm_max_ps(lo, hi);
-    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
-    m = _mm_max_ps(m, _mm_shuffle_ps(m, m, 0x55));
-    return _mm_cvtss_f32(m);
-}
+typedef float qrw_t;
 
-/**
- * @brief Robust Householder vector construction (AVX2-assisted).
- *
- * @details
- *  Builds a numerically stable Householder reflector for the vector x of length
- *  @p len using scaling by max |x| to avoid overflow/underflow. On return:
- *   - v[0] = 1, v[1:] = x[1:]/β
- *   - x[0] = -β (β has the sign chosen to reduce cancellation)
- *   - Returns τ = 2 / (1 + σ/β²) (the standard Householder scalar)
- *
- *  Algorithm follows Golub & Van Loan §5.1.3 with Parlett's β selection rule
- *  to avoid cancellation when computing the reflection axis.
- *
- * @param[out] v     Output Householder vector (length @p len).
- * @param[in,out] x  On input: target vector segment; on output: x[0] = -β.
- * @param[in]  len   Length of the vector segment.
- *
- * @return τ (tau) scaling for the reflector; returns 0 when x is (near) zero.
- *
- * @note Uses AVX2 to compute max norm and squared norm; has scalar tails.
- * @warning v and x must reference valid buffers of length at least @p len.
- */
-static float householder_vec_avx(float *RESTRICT v, float *RESTRICT x, uint16_t len)
+/* ------------------ Householder + Panel (unblocked) ------------------ */
+
+// robust Householder for a contiguous vector x[0..len-1]
+static qrw_t qrw_householder_robust(qrw_t *RESTRICT x, uint16_t len, qrw_t *beta_out)
 {
     if (len == 0)
-        return 0.0f;
-
-    /* --------------------------------------------------------------------
-     * Step 1: Find amax = max_i |x[i]| (vectorized with horizontal max)
-     * -------------------------------------------------------------------- */
-    __m256 amax8 = _mm256_setzero_ps();
-    uint16_t i = 0;
-    for (; i + 7 < len; i += 8)
     {
-        __m256 xv = _mm256_loadu_ps(x + i);
-        __m256 ax = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), xv); /* fabsf */
-        amax8 = _mm256_max_ps(amax8, ax);
+        *beta_out = 0;
+        return 0;
     }
-    
-    /* Reduce 8 lanes to scalar max */
-    float amax = hmax8_ps(amax8);
-    
-    /* Scalar tail */
-    for (; i < len; ++i)
+
+    qrw_t amax = 0;
+    for (uint16_t i = 0; i < len; ++i)
     {
-        float ax = fabsf(x[i]);
+        qrw_t ax = (qrw_t)fabs((double)x[i]);
         if (ax > amax)
             amax = ax;
     }
-
-    if (amax == 0.0f)
+    if (amax == 0)
     {
-        /* x is zero ⇒ no reflection needed */
-        v[0] = 1.0f;
-        for (uint16_t t = 1; t < len; ++t)
-            v[t] = 0.0f;
-        x[0] = 0.0f;
-        return 0.0f;
+        *beta_out = 0;
+        x[0] = 1;
+        return 0;
     }
 
-    /* --------------------------------------------------------------------
-     * Step 2: Scale by amax to prevent overflow: y = x / amax
-     * -------------------------------------------------------------------- */
-    const float alpha = x[0] / amax;  /* Scaled first element */
-
-    /* Compute ||y||² (vectorized with horizontal sum) */
-    __m256 acc = _mm256_setzero_ps();
-    const __m256 scale_inv = _mm256_set1_ps(1.0f / amax);
-    
-    i = 0;
-    for (; i + 7 < len; i += 8)
+    qrw_t alpha = x[0] / amax;
+    qrw_t normy2 = 0;
+    for (uint16_t i = 0; i < len; ++i)
     {
-        __m256 xv = _mm256_loadu_ps(x + i);
-        __m256 yv = _mm256_mul_ps(xv, scale_inv);  /* y = x / amax */
-        acc = _mm256_fmadd_ps(yv, yv, acc);        /* acc += y² */
-    }
-    
-    /* Reduce 8 lanes to scalar sum */
-    float normy2 = hsum8_ps(acc);
-    
-    /* Scalar tail */
-    for (; i < len; ++i)
-    {
-        const float yi = x[i] / amax;
+        qrw_t yi = x[i] / amax;
         normy2 += yi * yi;
     }
-
-    /* --------------------------------------------------------------------
-     * Step 3: Compute σ = ||y[1:]||² = ||y||² - y[0]²
-     * -------------------------------------------------------------------- */
-    const float sigma = normy2 - alpha * alpha;
-    
-    if (sigma <= 0.0f)
+    qrw_t sigma = normy2 - alpha * alpha;
+    if (sigma <= 0)
     {
-        /* x is essentially [*, 0, 0, ...] ⇒ trivial reflection */
-        v[0] = 1.0f;
-        for (uint16_t t = 1; t < len; ++t)
-            v[t] = 0.0f;
-        x[0] = -x[0]; /* Keep contract: x[0] = -β (β = |x[0]|) */
-        return 0.0f;
+        *beta_out = -x[0];
+        x[0] = 1;
+        return 0;
     }
 
-    /* --------------------------------------------------------------------
-     * Step 4: Choose β to avoid cancellation (Parlett's rule)
-     * -------------------------------------------------------------------- */
-    const float normy = sqrtf(normy2);  /* ||y|| */
-    
-    float beta_scaled;
-    if (alpha <= 0.0f)
-    {
-        /* α ≤ 0: β = α − ||y|| (both negative, stable subtraction) */
-        beta_scaled = alpha - normy;
-    }
-    else
-    {
-        /* α > 0: β = −σ / (α + ||y||) to avoid α − ||y|| cancellation */
-        beta_scaled = -sigma / (alpha + normy);
-    }
-    
-    const float beta = beta_scaled * amax;  /* Rescale to original units */
+    qrw_t normy = (qrw_t)sqrt((double)(alpha * alpha + sigma));
+    qrw_t beta_scaled = (alpha <= 0) ? (alpha - normy) : (-sigma / (alpha + normy));
+    qrw_t beta = beta_scaled * amax;
+    qrw_t b2 = beta_scaled * beta_scaled;
+    qrw_t tau = (qrw_t)2.0 * b2 / (sigma + b2);
 
-    /* --------------------------------------------------------------------
-     * Step 5: Compute τ = 2 / (1 + σ/β²)
-     * -------------------------------------------------------------------- */
-    const float tau = (2.0f * beta_scaled * beta_scaled) / (sigma + beta_scaled * beta_scaled);
-
-    /* --------------------------------------------------------------------
-     * Step 6: Build Householder vector v and update x[0]
-     * -------------------------------------------------------------------- */
-    v[0] = 1.0f;
-    const float beta_inv = 1.0f / beta;
-    for (uint16_t t = 1; t < len; ++t)
-        v[t] = x[t] * beta_inv;
-    
-    x[0] = -beta;  /* Store -β in x[0] (becomes new R[k,k]) */
-    
+    qrw_t invb = 1.0f / beta;
+    for (uint16_t i = 1; i < len; ++i)
+        x[i] *= invb;
+    x[0] = 1.0f;
+    *beta_out = beta;
     return tau;
+}
+
+// Panel QR (unblocked Householders)
+static void qrw_panel_geqr2(qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                            uint16_t k, uint16_t ib, qrw_t *RESTRICT tau_panel,
+                            qrw_t *RESTRICT tmp /* len >= m */)
+{
+    const uint16_t end = (uint16_t)((k + ib <= n) ? (k + ib) : n);
+
+    for (uint16_t j = k; j < end; ++j)
+    {
+        uint16_t rows = (uint16_t)(m - j);
+        qrw_t *colj0 = A + (size_t)j * n + j; // A[j,j] (row-major, down column uses stride n)
+        for (uint16_t r = 0; r < rows; ++r)
+            tmp[r] = colj0[(size_t)r * n];
+
+        qrw_t beta;
+        qrw_t tauj = qrw_householder_robust(tmp, rows, &beta);
+        tau_panel[j - k] = tauj;
+
+        for (uint16_t r = 0; r < rows; ++r)
+            colj0[(size_t)r * n] = tmp[r];
+        *(A + (size_t)j * n + j) = -beta;
+
+        if (tauj != 0 && j + 1 < end)
+        {
+            for (uint16_t c = (uint16_t)(j + 1); c < end; ++c)
+            {
+                qrw_t sum = 0;
+                for (uint16_t r = 0; r < rows; ++r)
+                    sum += colj0[(size_t)r * n] * A[(size_t)(j + r) * n + c];
+                sum *= tauj;
+                for (uint16_t r = 0; r < rows; ++r)
+                    A[(size_t)(j + r) * n + c] -= colj0[(size_t)r * n] * sum;
+            }
+        }
+    }
+}
+
+/* ------------------ Build T (LARFT) ------------------ */
+
+static void qrw_larft(qrw_t *RESTRICT T, uint16_t ib,
+                      const qrw_t *RESTRICT A, uint16_t m, uint16_t n, uint16_t k,
+                      const qrw_t *RESTRICT tau_panel)
+{
+    for (uint16_t i = 0; i < ib; ++i)
+        for (uint16_t j = 0; j < ib; ++j)
+            T[(size_t)i * ib + j] = 0;
+
+    for (uint16_t j = 0; j < ib; ++j)
+    {
+        for (uint16_t i = 0; i < j; ++i)
+        {
+            const qrw_t *vi = A + (size_t)(k + i) * n + (k + i);
+            const qrw_t *vj = A + (size_t)(k + j) * n + (k + j);
+            uint16_t len_j = (uint16_t)(m - (k + j));
+            qrw_t sum = vi[(size_t)(j - i) * n]; // vj[0] == 1
+            for (uint16_t r = 1; r < len_j; ++r)
+                sum += vi[(size_t)(j - i + r) * n] * vj[(size_t)r * n];
+            T[(size_t)i * ib + j] = -tau_panel[j] * sum;
+        }
+        T[(size_t)j * ib + j] = tau_panel[j];
+
+        for (int i = (int)j - 1; i >= 0; --i)
+        {
+            qrw_t acc = T[(size_t)i * ib + j];
+            for (uint16_t p = (uint16_t)(i + 1); p < j; ++p)
+                acc += T[(size_t)i * ib + p] * T[(size_t)p * ib + j];
+            T[(size_t)i * ib + j] = acc;
+        }
+    }
+}
+
+/* ------------------ Packers ------------------ */
+
+static void qrw_pack_C(const qrw_t *RESTRICT C, uint16_t ld, uint16_t m_sub,
+                       uint16_t c0, uint16_t kc, qrw_t *RESTRICT Cp)
+{
+    for (uint16_t r = 0; r < m_sub; ++r)
+    {
+        const qrw_t *src = C + (size_t)r * ld + c0;
+        memcpy(Cp + (size_t)r * kc, src, (size_t)kc * sizeof(qrw_t));
+    }
+}
+
+static void qrw_unpack_C(qrw_t *RESTRICT C, uint16_t ld, uint16_t m_sub,
+                         uint16_t c0, uint16_t kc, const qrw_t *RESTRICT Cp)
+{
+    for (uint16_t r = 0; r < m_sub; ++r)
+    {
+        qrw_t *dst = C + (size_t)r * ld + c0;
+        memcpy(dst, Cp + (size_t)r * kc, (size_t)kc * sizeof(qrw_t));
+    }
+}
+
+/* ------------------ Scalar Level-3 (fallback) ------------------ */
+
+// Y = V^T * Cpack   (ib × kc)
+static void qrw_compute_Y_scalar(const qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                                 uint16_t k, uint16_t ib,
+                                 const qrw_t *RESTRICT Cpack, uint16_t m_sub,
+                                 uint16_t kc, qrw_t *RESTRICT Y)
+{
+    for (uint16_t j = 0; j < kc; ++j)
+    {
+        for (uint16_t p = 0; p < ib; ++p)
+        {
+            const qrw_t *vp = A + (size_t)(k + p) * n + (k + p);
+            uint16_t len = (uint16_t)(m - (k + p));
+            qrw_t sum = 0;
+            for (uint16_t r = 0; r < len; ++r)
+                sum += vp[(size_t)r * n] * Cpack[(size_t)(r + p) * kc + j];
+            Y[(size_t)p * kc + j] = sum;
+        }
+    }
+}
+
+// Z = T * Y   (ib × kc)
+static void qrw_compute_Z_scalar(const qrw_t *RESTRICT T, uint16_t ib,
+                                 const qrw_t *RESTRICT Y, uint16_t kc,
+                                 qrw_t *RESTRICT Z)
+{
+    for (uint16_t i = 0; i < ib; ++i)
+    {
+        for (uint16_t j = 0; j < kc; ++j)
+        {
+            qrw_t sum = 0;
+            for (uint16_t p = 0; p < ib; ++p)
+                sum += T[(size_t)i * ib + p] * Y[(size_t)p * kc + j];
+            Z[(size_t)i * kc + j] = sum;
+        }
+    }
+}
+
+// Cpack = Cpack − V * Z
+static void qrw_apply_VZ_scalar(qrw_t *RESTRICT Cpack, uint16_t m_sub, uint16_t kc,
+                                const qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                                uint16_t k, uint16_t ib,
+                                const qrw_t *RESTRICT Z)
+{
+    for (uint16_t j = 0; j < kc; ++j)
+    {
+        for (uint16_t p = 0; p < ib; ++p)
+        {
+            const qrw_t *vp = A + (size_t)(k + p) * n + (k + p);
+            uint16_t len = (uint16_t)(m - (k + p));
+            qrw_t zp = Z[(size_t)p * kc + j];
+            for (uint16_t r = 0; r < len; ++r)
+                Cpack[(size_t)(r + p) * kc + j] -= vp[(size_t)r * n] * zp;
+        }
+    }
+}
+
+/* ------------------ AVX2 Level-3 (vectorized) ------------------ */
+
+#if LINALG_SIMD_ENABLE
+// horizontal sum for __m256
+static inline float qrw_hsum8(__m256 v)
+{
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    __m128 sh = _mm_movehdup_ps(s);
+    s = _mm_add_ps(s, sh);
+    sh = _mm_movehl_ps(sh, s);
+    s = _mm_add_ss(s, sh);
+    return _mm_cvtss_f32(s);
+}
+
+// Vectorized: Y = V^T * Cpack  (ib × kc)
+// We vectorize across columns j in chunks of 16 (two 8-lane accumulators).
+static void qrw_compute_Y_avx(const qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                              uint16_t k, uint16_t ib,
+                              const qrw_t *RESTRICT Cpack, uint16_t m_sub,
+                              uint16_t kc, qrw_t *RESTRICT Y)
+{
+    (void)m_sub; // not needed, we derive from m,k,p
+    for (uint16_t p = 0; p < ib; ++p)
+    {
+        const float *vp = A + (size_t)(k + p) * n + (k + p);
+        const uint16_t len = (uint16_t)(m - (k + p));
+
+        uint16_t j = 0;
+        // alignment peel for Cpack row start (row offset p)
+        // Each row r contributes Cpack[(r+p)*kc + j]
+        // We'll just use unaligned loads for simplicity on Cpack; we still peel to make stores aligned if desired.
+        for (; j + 15 < kc; j += 16)
+        {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            // accumulate over r
+            for (uint16_t r = 0; r < len; ++r)
+            {
+                const __m256 vv = _mm256_set1_ps(vp[(size_t)r * n]);
+                const float *cptr = Cpack + (size_t)(r + p) * kc + j;
+                acc0 = _mm256_fmadd_ps(vv, _mm256_loadu_ps(cptr + 0), acc0);
+                acc1 = _mm256_fmadd_ps(vv, _mm256_loadu_ps(cptr + 8), acc1);
+            }
+            _mm256_storeu_ps(Y + (size_t)p * kc + j + 0, acc0);
+            _mm256_storeu_ps(Y + (size_t)p * kc + j + 8, acc1);
+        }
+        for (; j + 7 < kc; j += 8)
+        {
+            __m256 acc = _mm256_setzero_ps();
+            for (uint16_t r = 0; r < len; ++r)
+            {
+                const __m256 vv = _mm256_set1_ps(vp[(size_t)r * n]);
+                const float *cptr = Cpack + (size_t)(r + p) * kc + j;
+                acc = _mm256_fmadd_ps(vv, _mm256_loadu_ps(cptr), acc);
+            }
+            _mm256_storeu_ps(Y + (size_t)p * kc + j, acc);
+        }
+        for (; j < kc; ++j)
+        {
+            float sum = 0.0f;
+            for (uint16_t r = 0; r < len; ++r)
+                sum += vp[(size_t)r * n] * Cpack[(size_t)(r + p) * kc + j];
+            Y[(size_t)p * kc + j] = sum;
+        }
+    }
+}
+
+// Vectorized: Z = T * Y  (ib × kc)
+// Vectorize across kc columns with 16-wide chunks; broadcast T(i,p).
+static void qrw_compute_Z_avx(const qrw_t *RESTRICT T, uint16_t ib,
+                              const qrw_t *RESTRICT Y, uint16_t kc,
+                              qrw_t *RESTRICT Z)
+{
+    for (uint16_t i = 0; i < ib; ++i)
+    {
+        uint16_t j = 0;
+        for (; j + 15 < kc; j += 16)
+        {
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            for (uint16_t p = 0; p < ib; ++p)
+            {
+                const __m256 t = _mm256_set1_ps(T[(size_t)i * ib + p]);
+                const float *y = Y + (size_t)p * kc + j;
+                acc0 = _mm256_fmadd_ps(t, _mm256_loadu_ps(y + 0), acc0);
+                acc1 = _mm256_fmadd_ps(t, _mm256_loadu_ps(y + 8), acc1);
+            }
+            _mm256_storeu_ps(Z + (size_t)i * kc + j + 0, acc0);
+            _mm256_storeu_ps(Z + (size_t)i * kc + j + 8, acc1);
+        }
+        for (; j + 7 < kc; j += 8)
+        {
+            __m256 acc = _mm256_setzero_ps();
+            for (uint16_t p = 0; p < ib; ++p)
+            {
+                const __m256 t = _mm256_set1_ps(T[(size_t)i * ib + p]);
+                const float *y = Y + (size_t)p * kc + j;
+                acc = _mm256_fmadd_ps(t, _mm256_loadu_ps(y), acc);
+            }
+            _mm256_storeu_ps(Z + (size_t)i * kc + j, acc);
+        }
+        for (; j < kc; ++j)
+        {
+            float sum = 0.0f;
+            for (uint16_t p = 0; p < ib; ++p)
+                sum += T[(size_t)i * ib + p] * Y[(size_t)p * kc + j];
+            Z[(size_t)i * kc + j] = sum;
+        }
+    }
+}
+
+// Vectorized: Cpack = Cpack − V * Z
+// Vectorize across kc columns similarly; broadcast each v_p[r] and subtract v*z row by row.
+static void qrw_apply_VZ_avx(qrw_t *RESTRICT Cpack, uint16_t m_sub, uint16_t kc,
+                             const qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                             uint16_t k, uint16_t ib,
+                             const qrw_t *RESTRICT Z)
+{
+    for (uint16_t p = 0; p < ib; ++p)
+    {
+        const float *vp = A + (size_t)(k + p) * n + (k + p);
+        const uint16_t len = (uint16_t)(m - (k + p));
+
+        uint16_t j = 0;
+        for (; j + 15 < kc; j += 16)
+        {
+            for (uint16_t r = 0; r < len; ++r)
+            {
+                const __m256 vz0 = _mm256_mul_ps(_mm256_set1_ps(vp[(size_t)r * n]),
+                                                 _mm256_loadu_ps(Z + (size_t)p * kc + j + 0));
+                const __m256 vz1 = _mm256_mul_ps(_mm256_set1_ps(vp[(size_t)r * n]),
+                                                 _mm256_loadu_ps(Z + (size_t)p * kc + j + 8));
+                float *cptr = Cpack + (size_t)(r + p) * kc + j;
+                __m256 c0 = _mm256_loadu_ps(cptr + 0);
+                __m256 c1 = _mm256_loadu_ps(cptr + 8);
+                c0 = _mm256_sub_ps(c0, vz0);
+                c1 = _mm256_sub_ps(c1, vz1);
+                _mm256_storeu_ps(cptr + 0, c0);
+                _mm256_storeu_ps(cptr + 8, c1);
+            }
+        }
+        for (; j + 7 < kc; j += 8)
+        {
+            for (uint16_t r = 0; r < len; ++r)
+            {
+                const __m256 vz = _mm256_mul_ps(_mm256_set1_ps(vp[(size_t)r * n]),
+                                                _mm256_loadu_ps(Z + (size_t)p * kc + j));
+                float *cptr = Cpack + (size_t)(r + p) * kc + j;
+                __m256 c = _mm256_loadu_ps(cptr);
+                c = _mm256_sub_ps(c, vz);
+                _mm256_storeu_ps(cptr, c);
+            }
+        }
+        for (; j < kc; ++j)
+        {
+            for (uint16_t r = 0; r < len; ++r)
+                Cpack[(size_t)(r + p) * kc + j] -= vp[(size_t)r * n] * Z[(size_t)p * kc + j];
+        }
+    }
 }
 #endif /* LINALG_SIMD_ENABLE */
 
-/**
- * @brief Apply a Householder reflector from the left to a trailing block (AVX2, blocked).
- *
- * @details
- *  Computes Rk ← Rk − v (τ vᵀ Rk), where Rk points to the top-left of the
- *  trailing block (R[k:,k:]) with leading dimension @p ld and width @p nc.
- *  The update is carried out in row/column tiles to improve cache locality.
- *
- * @param[in,out] Rk   Pointer to R[k,k] (row-major), updated in place.
- * @param[in]     ld   Leading dimension of R (number of columns n).
- * @param[in]     v    Householder vector of length @p len (v[0]=1).
- * @param[in]     len  Number of rows in the trailing block (m-k).
- * @param[in]     tau  Householder scalar τ.
- * @param[in]     nc   Number of columns in the trailing block (n-k).
- *
- * @note Temporarily allocates a workspace t[0..nc-1] (aligned).
- * @warning Returns silently if workspace allocation fails. Caller should ensure
- *          Rk has room for (len×nc) elements from the given pointer/ld.
- */
-static void apply_reflector_left_blocked_avx(float *RESTRICT Rk, uint16_t ld,
-                                             const float *RESTRICT v, uint16_t len,
-                                             float tau, uint16_t nc)
+/* ------------------ Blocked driver: GEQRF (in-place reflectors + tau) ------------------ */
+
+static int qrw_geqrf_blocked_wy(qrw_t *RESTRICT A, uint16_t m, uint16_t n,
+                                uint16_t ib, qrw_t *RESTRICT tau_out)
 {
-    if (tau == 0.0f)
-        return;
+    if (m == 0 || n == 0)
+        return 0;
+    if (ib == 0)
+        ib = QRW_IB_DEFAULT;
 
-    const uint16_t Jc = (uint16_t)LINALG_BLOCK_JC;
-    const uint16_t Kc = (uint16_t)LINALG_BLOCK_KC;
+    const uint16_t kmax = (m < n) ? m : n;
+    qrw_t *tmp = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m * sizeof(qrw_t));
+    if (!tmp)
+        return -ENOMEM;
 
-    /* temp: t[0..nc-1] */
-    float *t = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)nc * sizeof(float));
-    if (!t)
-        return;
-
-    /* t = tau * (v^T * Rk) — compute in column tiles */
-    for (uint16_t c0 = 0; c0 < nc; c0 += Kc)
+    uint16_t k = 0;
+    while (k < kmax)
     {
-        const uint16_t kc = (uint16_t)((c0 + Kc <= nc) ? Kc : (nc - c0));
-        float *tc = t + c0;
+        uint16_t ib_k = (uint16_t)((k + ib <= kmax) ? ib : (kmax - k));
+        qrw_t *tau_panel = tau_out + k;
 
-        /* fast zero tc */
-        uint16_t zc = 0;
-        const __m256 z = _mm256_setzero_ps();
-        for (; zc + 7 < kc; zc += 8)
-            _mm256_storeu_ps(tc + zc, z);
-        for (; zc < kc; ++zc)
-            tc[zc] = 0.0f;
+        // 1) Panel factorization
+        qrw_panel_geqr2(A, m, n, k, ib_k, tau_panel, tmp);
 
-        /* accumulate v^T * Rk in row tiles */
-        for (uint16_t r0 = 0; r0 < len; r0 += Jc)
+        // 2) Build T
+        qrw_t *T = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * ib_k * sizeof(qrw_t));
+        if (!T)
         {
-            const uint16_t jr = (uint16_t)((r0 + Jc <= len) ? Jc : (len - r0));
-            uint16_t r = r0;
+            linalg_aligned_free(tmp);
+            return -ENOMEM;
+        }
+        qrw_larft(T, ib_k, A, m, n, k, tau_panel);
 
-            /* 8-row chunks */
-            for (; r + 7 < r0 + jr; r += 8)
+        // 3) Apply block reflector to trailing matrix C = A[k:m, k+ib_k:n]
+        const uint16_t m_sub = (uint16_t)(m - k);
+        const uint16_t nc = (uint16_t)(n - (k + ib_k));
+        if (nc)
+        {
+            const uint16_t kc_tile = (uint16_t)LINALG_BLOCK_KC;
+            qrw_t *Cpack = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m_sub * kc_tile * sizeof(qrw_t));
+            qrw_t *Y = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+            qrw_t *Z = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+            if (!Cpack || !Y || !Z)
             {
-                const float *row0 = Rk + (size_t)(r + 0) * ld + c0;
-                const float *row1 = Rk + (size_t)(r + 1) * ld + c0;
-                const float *row2 = Rk + (size_t)(r + 2) * ld + c0;
-                const float *row3 = Rk + (size_t)(r + 3) * ld + c0;
-                const float *row4 = Rk + (size_t)(r + 4) * ld + c0;
-                const float *row5 = Rk + (size_t)(r + 5) * ld + c0;
-                const float *row6 = Rk + (size_t)(r + 6) * ld + c0;
-                const float *row7 = Rk + (size_t)(r + 7) * ld + c0;
-
-                const __m256 v0 = _mm256_broadcast_ss(v + (r + 0));
-                const __m256 v1 = _mm256_broadcast_ss(v + (r + 1));
-                const __m256 v2 = _mm256_broadcast_ss(v + (r + 2));
-                const __m256 v3 = _mm256_broadcast_ss(v + (r + 3));
-                const __m256 v4 = _mm256_broadcast_ss(v + (r + 4));
-                const __m256 v5 = _mm256_broadcast_ss(v + (r + 5));
-                const __m256 v6 = _mm256_broadcast_ss(v + (r + 6));
-                const __m256 v7 = _mm256_broadcast_ss(v + (r + 7));
-
-                uint16_t cc = 0;
-                for (; cc + 7 < kc; cc += 8)
-                {
-                    __m256 acc = _mm256_loadu_ps(tc + cc);
-
-                    _mm_prefetch((const char *)(row0 + cc + 64), _MM_HINT_T0);
-                    acc = _mm256_fmadd_ps(v0, _mm256_loadu_ps(row0 + cc), acc);
-                    acc = _mm256_fmadd_ps(v1, _mm256_loadu_ps(row1 + cc), acc);
-                    acc = _mm256_fmadd_ps(v2, _mm256_loadu_ps(row2 + cc), acc);
-                    acc = _mm256_fmadd_ps(v3, _mm256_loadu_ps(row3 + cc), acc);
-                    acc = _mm256_fmadd_ps(v4, _mm256_loadu_ps(row4 + cc), acc);
-                    acc = _mm256_fmadd_ps(v5, _mm256_loadu_ps(row5 + cc), acc);
-                    acc = _mm256_fmadd_ps(v6, _mm256_loadu_ps(row6 + cc), acc);
-                    acc = _mm256_fmadd_ps(v7, _mm256_loadu_ps(row7 + cc), acc);
-
-                    _mm256_storeu_ps(tc + cc, acc);
-                }
-                for (; cc < kc; ++cc)
-                {
-                    tc[cc] += v[r + 0] * row0[cc] + v[r + 1] * row1[cc] + v[r + 2] * row2[cc] + v[r + 3] * row3[cc] + v[r + 4] * row4[cc] + v[r + 5] * row5[cc] + v[r + 6] * row6[cc] + v[r + 7] * row7[cc];
-                }
+                if (Cpack)
+                    linalg_aligned_free(Cpack);
+                if (Y)
+                    linalg_aligned_free(Y);
+                if (Z)
+                    linalg_aligned_free(Z);
+                linalg_aligned_free(T);
+                linalg_aligned_free(tmp);
+                return -ENOMEM;
             }
 
-            /* leftover rows in this row tile */
-            for (; r < r0 + jr; ++r)
+            qrw_t *C = A + (size_t)k * n + (k + ib_k);
+            for (uint16_t c0 = 0; c0 < nc; c0 += kc_tile)
             {
-                const float vr = v[r];
-                const float *row = Rk + (size_t)r * ld + c0;
-                uint16_t cc2 = 0;
-                const __m256 vrv = _mm256_set1_ps(vr);
-                for (; cc2 + 7 < kc; cc2 += 8)
-                {
-                    __m256 acc = _mm256_loadu_ps(tc + cc2);
-                    acc = _mm256_fmadd_ps(vrv, _mm256_loadu_ps(row + cc2), acc);
-                    _mm256_storeu_ps(tc + cc2, acc);
-                }
-                for (; cc2 < kc; ++cc2)
-                    tc[cc2] += vr * row[cc2];
-            }
-        }
-
-        /* scale t by tau */
-        const __m256 tv = _mm256_set1_ps(tau);
-        uint16_t sc = 0;
-        for (; sc + 7 < kc; sc += 8)
-        {
-            __m256 vv = _mm256_loadu_ps(tc + sc);
-            _mm256_storeu_ps(tc + sc, _mm256_mul_ps(vv, tv));
-        }
-        for (; sc < kc; ++sc)
-            tc[sc] *= tau;
-    }
-
-    /* Apply: Rk -= v * t   (rank-1 update) */
-    for (uint16_t r0 = 0; r0 < len; r0 += Jc)
-    {
-        const uint16_t jr = (uint16_t)((r0 + Jc <= len) ? Jc : (len - r0));
-        uint16_t r = r0;
-
-        /* 8-row chunks */
-        for (; r + 7 < r0 + jr; r += 8)
-        {
-            float *row0 = Rk + (size_t)(r + 0) * ld;
-            float *row1 = Rk + (size_t)(r + 1) * ld;
-            float *row2 = Rk + (size_t)(r + 2) * ld;
-            float *row3 = Rk + (size_t)(r + 3) * ld;
-            float *row4 = Rk + (size_t)(r + 4) * ld;
-            float *row5 = Rk + (size_t)(r + 5) * ld;
-            float *row6 = Rk + (size_t)(r + 6) * ld;
-            float *row7 = Rk + (size_t)(r + 7) * ld;
-
-            const __m256 v0 = _mm256_broadcast_ss(v + (r + 0));
-            const __m256 v1 = _mm256_broadcast_ss(v + (r + 1));
-            const __m256 v2 = _mm256_broadcast_ss(v + (r + 2));
-            const __m256 v3 = _mm256_broadcast_ss(v + (r + 3));
-            const __m256 v4 = _mm256_broadcast_ss(v + (r + 4));
-            const __m256 v5 = _mm256_broadcast_ss(v + (r + 5));
-            const __m256 v6 = _mm256_broadcast_ss(v + (r + 6));
-            const __m256 v7 = _mm256_broadcast_ss(v + (r + 7));
-
-            for (uint16_t c0 = 0; c0 < nc; c0 += Kc)
-            {
-                const uint16_t kc = (uint16_t)((c0 + Kc <= nc) ? Kc : (nc - c0));
-                float *tc = t + c0;
-
-                uint16_t cc = 0;
-                for (; cc + 7 < kc; cc += 8)
-                {
-                    const __m256 t8 = _mm256_loadu_ps(tc + cc);
-
-                    __m256 r0v = _mm256_loadu_ps(row0 + c0 + cc);
-                    __m256 r1v = _mm256_loadu_ps(row1 + c0 + cc);
-                    __m256 r2v = _mm256_loadu_ps(row2 + c0 + cc);
-                    __m256 r3v = _mm256_loadu_ps(row3 + c0 + cc);
-                    __m256 r4v = _mm256_loadu_ps(row4 + c0 + cc);
-                    __m256 r5v = _mm256_loadu_ps(row5 + c0 + cc);
-                    __m256 r6v = _mm256_loadu_ps(row6 + c0 + cc);
-                    __m256 r7v = _mm256_loadu_ps(row7 + c0 + cc);
-
-                    r0v = _mm256_fnmadd_ps(v0, t8, r0v);
-                    r1v = _mm256_fnmadd_ps(v1, t8, r1v);
-                    r2v = _mm256_fnmadd_ps(v2, t8, r2v);
-                    r3v = _mm256_fnmadd_ps(v3, t8, r3v);
-                    r4v = _mm256_fnmadd_ps(v4, t8, r4v);
-                    r5v = _mm256_fnmadd_ps(v5, t8, r5v);
-                    r6v = _mm256_fnmadd_ps(v6, t8, r6v);
-                    r7v = _mm256_fnmadd_ps(v7, t8, r7v);
-
-                    _mm256_storeu_ps(row0 + c0 + cc, r0v);
-                    _mm256_storeu_ps(row1 + c0 + cc, r1v);
-                    _mm256_storeu_ps(row2 + c0 + cc, r2v);
-                    _mm256_storeu_ps(row3 + c0 + cc, r3v);
-                    _mm256_storeu_ps(row4 + c0 + cc, r4v);
-                    _mm256_storeu_ps(row5 + c0 + cc, r5v);
-                    _mm256_storeu_ps(row6 + c0 + cc, r6v);
-                    _mm256_storeu_ps(row7 + c0 + cc, r7v);
-                }
-                for (; cc < kc; ++cc)
-                {
-                    const float tc1 = tc[cc];
-                    row0[c0 + cc] -= v[r + 0] * tc1;
-                    row1[c0 + cc] -= v[r + 1] * tc1;
-                    row2[c0 + cc] -= v[r + 2] * tc1;
-                    row3[c0 + cc] -= v[r + 3] * tc1;
-                    row4[c0 + cc] -= v[r + 4] * tc1;
-                    row5[c0 + cc] -= v[r + 5] * tc1;
-                    row6[c0 + cc] -= v[r + 6] * tc1;
-                    row7[c0 + cc] -= v[r + 7] * tc1;
-                }
-            }
-        }
-
-        /* leftover rows in this tile */
-        for (; r < r0 + jr; ++r)
-        {
-            const float vr = v[r];
-            float *row = Rk + (size_t)r * ld;
-            const __m256 vrv = _mm256_set1_ps(vr);
-
-            for (uint16_t c0 = 0; c0 < nc; c0 += Kc)
-            {
-                const uint16_t kc = (uint16_t)((c0 + Kc <= nc) ? Kc : (nc - c0));
-                float *tc = t + c0;
-
-                uint16_t cc = 0;
-                for (; cc + 7 < kc; cc += 8)
-                {
-                    __m256 rv = _mm256_loadu_ps(row + c0 + cc);
-                    rv = _mm256_fnmadd_ps(vrv, _mm256_loadu_ps(tc + cc), rv);
-                    _mm256_storeu_ps(row + c0 + cc, rv);
-                }
-                for (; cc < kc; ++cc)
-                    row[c0 + cc] -= vr * tc[cc];
-            }
-        }
-    }
-
-    linalg_aligned_free(t);
-}
-
-/**
- * @brief Apply a Householder reflector to Q from the right (AVX2).
- *
- * @details
- *  Updates Q[:,k:] ← Q[:,k:] − (τ Q[:,k:] v) vᵀ, where v has length @p len
- *  and @p k is the starting column. Uses AVX2 for both the row-wise dot product
- *  (Q[:,k:] * v) and the subsequent rank-1 update.
- *
- * @param[in,out] Q    Orthogonal accumulator (m×m), updated in place.
- * @param[in]     m    Order of Q (rows == cols).
- * @param[in]     k    Starting column index for the trailing block.
- * @param[in]     v    Householder vector (length @p len, v[0]=1).
- * @param[in]     len  Number of columns in the trailing block (m-k).
- * @param[in]     tau  Householder scalar τ.
- *
- * @note Allocates a temporary y[0..m-1] (aligned) for the intermediate product.
- * @warning No bounds checks; caller guarantees valid ranges (k+len ≤ m).
- */
-static void apply_reflector_right_Q_avx(float *RESTRICT Q, uint16_t m,
-                                        uint16_t k,
-                                        const float *RESTRICT v, uint16_t len,
-                                        float tau)
-{
-    if (tau == 0.0f)
-        return;
-
-    float *y = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m * sizeof(float));
-    if (!y)
-        return;
-
-    const uint16_t Jc = (uint16_t)LINALG_BLOCK_JC; /* reuse as row-blocking for Q */
-
-    /* y = tau * (Q[:,k:] * v) */
-    for (uint16_t r0 = 0; r0 < m; r0 += Jc)
-    {
-        const uint16_t jr = (uint16_t)((r0 + Jc <= m) ? Jc : (m - r0));
-        for (uint16_t r = 0; r < jr; ++r)
-        {
-            const float *q = Q + (size_t)(r0 + r) * m + k;
-            uint16_t j = 0;
-            __m256 acc = _mm256_setzero_ps();
-            for (; j + 7 < len; j += 8)
-            {
-                acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + j), _mm256_loadu_ps(v + j), acc);
-            }
-            float sum = hsum8_ps(acc);
-            for (; j < len; ++j)
-                sum += q[j] * v[j];
-            y[r0 + r] = sum * tau;
-        }
-    }
-
-    /* Q[:,k:] -= y * v^T  (rank-1, block rows) */
-    for (uint16_t r0 = 0; r0 < m; r0 += Jc)
-    {
-        const uint16_t jr = (uint16_t)((r0 + Jc <= m) ? Jc : (m - r0));
-        for (uint16_t r = 0; r < jr; ++r)
-        {
-            float *q = Q + (size_t)(r0 + r) * m + k;
-            const __m256 yr = _mm256_set1_ps(y[r0 + r]);
-            uint16_t j = 0;
-            for (; j + 7 < len; j += 8)
-            {
-                __m256 qv = _mm256_loadu_ps(q + j);
-                __m256 vv = _mm256_loadu_ps(v + j);
-                qv = _mm256_fnmadd_ps(yr, vv, qv);
-                _mm256_storeu_ps(q + j, qv);
-            }
-            for (; j < len; ++j)
-                q[j] -= y[r0 + r] * v[j];
-        }
-    }
-
-    linalg_aligned_free(y);
-}
-
-/**
- * @brief Apply a Householder reflector to Q from the right (scalar fallback).
- *
- * @details
- *  Scalar equivalent of apply_reflector_right_Q_avx(). Computes y = τ Q[:,k:] v
- *  and applies the rank-1 update Q[:,k:] -= y vᵀ using simple loops.
- *
- * @param[in,out] Q    Orthogonal accumulator (m×m), updated in place.
- * @param[in]     m    Order of Q (rows == cols).
- * @param[in]     k    Starting column index for the trailing block.
- * @param[in]     v    Householder vector (length @p len, v[0]=1).
- * @param[in]     len  Number of columns in the trailing block (m-k).
- * @param[in]     tau  Householder scalar τ.
- *
- * @note Used when LINALG_SIMD_ENABLE is false at build time.
- */
-#if !LINALG_SIMD_ENABLE
-static void apply_reflector_right_Q_scalar(float *RESTRICT Q, uint16_t m,
-                                           uint16_t k,
-                                           const float *RESTRICT v, uint16_t len,
-                                           float tau)
-{
-    if (tau == 0.0f)
-        return;
-    float *y = (float *)malloc((size_t)m * sizeof(float));
-    if (!y)
-        return;
-    memset(y, 0, (size_t)m * sizeof(float));
-
-    /* y = Q[:,k:] * v */
-    for (uint16_t r = 0; r < m; ++r)
-    {
-        const float *q = Q + (size_t)r * m + k;
-        float sum = 0.0f;
-        for (uint16_t j = 0; j < len; ++j)
-            sum += q[j] * v[j];
-        y[r] = sum * tau;
-    }
-    /* Q[:,k:] -= y * v^T */
-    for (uint16_t r = 0; r < m; ++r)
-    {
-        float *q = Q + (size_t)r * m + k;
-        const float yr = y[r];
-        for (uint16_t j = 0; j < len; ++j)
-            q[j] -= yr * v[j];
-    }
-    free(y);
-}
+                uint16_t kc = (uint16_t)((c0 + kc_tile <= nc) ? kc_tile : (nc - c0));
+                qrw_pack_C(C, n, m_sub, c0, kc, Cpack);
+#if LINALG_SIMD_ENABLE
+                qrw_compute_Y_avx(A, m, n, k, ib_k, Cpack, m_sub, kc, Y);
+                qrw_compute_Z_avx(T, ib_k, Y, kc, Z);
+                qrw_apply_VZ_avx(Cpack, m_sub, kc, A, m, n, k, ib_k, Z);
+#else
+                qrw_compute_Y_scalar(A, m, n, k, ib_k, Cpack, m_sub, kc, Y);
+                qrw_compute_Z_scalar(T, ib_k, Y, kc, Z);
+                qrw_apply_VZ_scalar(Cpack, m_sub, kc, A, m, n, k, ib_k, Z);
 #endif
+                qrw_unpack_C(C, n, m_sub, c0, kc, Cpack);
+            }
 
-/**
- * @brief Single-precision QR decomposition via Householder reflections.
- *
- * @details
- *  Computes the QR factorization of A (m×n), producing R (upper-triangular).
- *  If @p only_R is false, also forms Q explicitly. The implementation chooses
- *  between a blocked AVX2/FMA path and a scalar reference path:
- *   - **Vectorized path**: Robust Householder vector generation, blocked left
- *     application on R, and right application on Q (if requested). Tuned with
- *     LINALG_BLOCK_{JC,KC} for cache residency and uses aligned workspaces.
- *   - **Scalar path**: Portable, small-matrix implementation that constructs
- *     reflectors and multiplies them using mul()/inv() helpers.
- *
- * @param[in]  A       Input matrix (m×n), row-major.
- * @param[out] Q       Output orthogonal matrix (m×m). Ignored if @p only_R=true.
- * @param[out] R       Output upper-triangular factor (m×n).
- * @param[in]  m       Number of rows of A.
- * @param[in]  n       Number of columns of A.
- * @param[in]  only_R  If true, compute only R (skip forming Q).
- *
- * @retval 0          Success.
- * @retval -EINVAL    Invalid sizes (m==0 or n==0).
- * @retval -ENOMEM    Allocation failure for temporary buffers (vector path).
- *
- * @warning Q and R must not alias A. Buffers must be valid and sized.
- * @note The vector path is selected when AVX2 is available and the problem
- *       is large enough (mn ≥ LINALG_SMALL_N_THRESH).
+            linalg_aligned_free(Cpack);
+            linalg_aligned_free(Y);
+            linalg_aligned_free(Z);
+        }
+
+        linalg_aligned_free(T);
+        k = (uint16_t)(k + ib_k);
+    }
+
+    linalg_aligned_free(tmp);
+    return 0;
+}
+
+/* ------------------ ORGQR: form Q explicitly from (A,V,tau) ------------------ */
+
+static int qrw_orgqr_full(qrw_t *RESTRICT Q, uint16_t m,
+                          const qrw_t *RESTRICT A, uint16_t n,
+                          const qrw_t *RESTRICT tau, uint16_t kreflect)
+{
+    for (uint16_t r = 0; r < m; ++r)
+    {
+        for (uint16_t c = 0; c < m; ++c)
+            Q[(size_t)r * m + c] = (r == c) ? 1.0f : 0.0f;
+    }
+
+    if (kreflect == 0)
+        return 0;
+
+    const uint16_t ib_def = QRW_IB_DEFAULT;
+
+    int64_t kk = (int64_t)kreflect;
+    while (kk > 0)
+    {
+        uint16_t ib_k = (uint16_t)((kk >= ib_def) ? ib_def : kk);
+        uint16_t kstart = (uint16_t)(kk - ib_k);
+
+        qrw_t *T = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * ib_k * sizeof(qrw_t));
+        if (!T)
+            return -ENOMEM;
+        qrw_larft(T, ib_k, A, m, n, kstart, tau + kstart);
+
+        const uint16_t m_sub = (uint16_t)(m - kstart);
+        const uint16_t kc_tile = (uint16_t)LINALG_BLOCK_KC;
+
+        qrw_t *Cpack = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m_sub * kc_tile * sizeof(qrw_t));
+        qrw_t *Y = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+        qrw_t *Z = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+        if (!Cpack || !Y || !Z)
+        {
+            if (Cpack)
+                linalg_aligned_free(Cpack);
+            if (Y)
+                linalg_aligned_free(Y);
+            if (Z)
+                linalg_aligned_free(Z);
+            linalg_aligned_free(T);
+            return -ENOMEM;
+        }
+
+        for (uint16_t c0 = 0; c0 < m; c0 += kc_tile)
+        {
+            uint16_t kc = (uint16_t)((c0 + kc_tile <= m) ? kc_tile : (m - c0));
+            qrw_t *C = Q + (size_t)kstart * m;
+            for (uint16_t r = 0; r < m_sub; ++r)
+                memcpy(Cpack + (size_t)r * kc, C + (size_t)r * m + c0, (size_t)kc * sizeof(qrw_t));
+#if LINALG_SIMD_ENABLE
+            qrw_compute_Y_avx(A, m, n, kstart, ib_k, Cpack, m_sub, kc, Y);
+            qrw_compute_Z_avx(T, ib_k, Y, kc, Z);
+            qrw_apply_VZ_avx(Cpack, m_sub, kc, A, m, n, kstart, ib_k, Z);
+#else
+            qrw_compute_Y_scalar(A, m, n, kstart, ib_k, Cpack, m_sub, kc, Y);
+            qrw_compute_Z_scalar(T, ib_k, Y, kc, Z);
+            qrw_apply_VZ_scalar(Cpack, m_sub, kc, A, m, n, kstart, ib_k, Z);
+#endif
+            for (uint16_t r = 0; r < m_sub; ++r)
+                memcpy(C + (size_t)r * m + c0, Cpack + (size_t)r * kc, (size_t)kc * sizeof(qrw_t));
+        }
+
+        linalg_aligned_free(Cpack);
+        linalg_aligned_free(Y);
+        linalg_aligned_free(Z);
+        linalg_aligned_free(T);
+        kk -= ib_k;
+    }
+    return 0;
+}
+
+/* ===========================================================================================
+ * Optional: CPQR (GEQP3) minimal (unchanged from previous drop)
+ * ===========================================================================================
  */
+
+static void qrw_swap_cols(qrw_t *A, uint16_t m, uint16_t n, uint16_t j1, uint16_t j2)
+{
+    if (j1 == j2)
+        return;
+    for (uint16_t r = 0; r < m; ++r)
+    {
+        qrw_t tmp = A[(size_t)r * n + j1];
+        A[(size_t)r * n + j1] = A[(size_t)r * n + j2];
+        A[(size_t)r * n + j2] = tmp;
+    }
+}
+
+static void qrw_colnorms(const qrw_t *RESTRICT A, uint16_t m, uint16_t n, uint16_t k,
+                         qrw_t *RESTRICT nrms)
+{
+    for (uint16_t j = k; j < n; ++j)
+    {
+        qrw_t s = 0;
+        for (uint16_t r = k; r < m; ++r)
+        {
+            qrw_t v = A[(size_t)r * n + j];
+            s += v * v;
+        }
+        nrms[j] = (qrw_t)sqrt((double)s);
+    }
+}
+
+int geqp3_blocked(float *RESTRICT A, uint16_t m, uint16_t n,
+                  uint16_t ib, float *RESTRICT tau, int *RESTRICT jpvt)
+{
+    for (uint16_t j = 0; j < n; ++j)
+        jpvt[j] = j;
+
+    qrw_t *nrm = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)n * sizeof(qrw_t));
+    qrw_t *nrm_ref = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)n * sizeof(qrw_t));
+    qrw_t *tmp = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m * sizeof(qrw_t));
+    if (!nrm || !nrm_ref || !tmp)
+    {
+        if (nrm)
+            linalg_aligned_free(nrm);
+        if (nrm_ref)
+            linalg_aligned_free(nrm_ref);
+        if (tmp)
+            linalg_aligned_free(tmp);
+        return -ENOMEM;
+    }
+
+    qrw_colnorms(A, m, n, 0, nrm);
+    memcpy(nrm_ref, nrm, (size_t)n * sizeof(qrw_t));
+
+    const uint16_t kmax = (m < n) ? m : n;
+    uint16_t k = 0;
+    while (k < kmax)
+    {
+        uint16_t pvt = k;
+        qrw_t best = nrm[pvt];
+        for (uint16_t j = (uint16_t)(k + 1); j < n; ++j)
+            if (nrm[j] > best)
+            {
+                best = nrm[j];
+                pvt = j;
+            }
+        qrw_swap_cols(A, m, n, k, pvt);
+        int tmpi = jpvt[k];
+        jpvt[k] = jpvt[pvt];
+        jpvt[pvt] = tmpi;
+        qrw_t tn = nrm[k];
+        nrm[k] = nrm[pvt];
+        nrm[pvt] = tn;
+        tn = nrm_ref[k];
+        nrm_ref[k] = nrm_ref[pvt];
+        nrm_ref[pvt] = tn;
+
+        uint16_t ib_k = (uint16_t)((k + ib <= kmax) ? ib : (kmax - k));
+        qrw_panel_geqr2(A, m, n, k, ib_k, tau + k, tmp);
+
+        qrw_t *T = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * ib_k * sizeof(qrw_t));
+        if (!T)
+        {
+            linalg_aligned_free(nrm);
+            linalg_aligned_free(nrm_ref);
+            linalg_aligned_free(tmp);
+            return -ENOMEM;
+        }
+        qrw_larft(T, ib_k, A, m, n, k, tau + k);
+
+        const uint16_t m_sub = (uint16_t)(m - k);
+        const uint16_t nc = (uint16_t)(n - (k + ib_k));
+        if (nc)
+        {
+            const uint16_t kc_tile = (uint16_t)LINALG_BLOCK_KC;
+            qrw_t *Cpack = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m_sub * kc_tile * sizeof(qrw_t));
+            qrw_t *Y = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+            qrw_t *Z = (qrw_t *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)ib_k * kc_tile * sizeof(qrw_t));
+            if (!Cpack || !Y || !Z)
+            {
+                if (Cpack)
+                    linalg_aligned_free(Cpack);
+                if (Y)
+                    linalg_aligned_free(Y);
+                if (Z)
+                    linalg_aligned_free(Z);
+                linalg_aligned_free(T);
+                linalg_aligned_free(nrm);
+                linalg_aligned_free(nrm_ref);
+                linalg_aligned_free(tmp);
+                return -ENOMEM;
+            }
+            qrw_t *C = A + (size_t)k * n + (k + ib_k);
+            for (uint16_t c0 = 0; c0 < nc; c0 += kc_tile)
+            {
+                uint16_t kc = (uint16_t)((c0 + kc_tile <= nc) ? kc_tile : (nc - c0));
+                qrw_pack_C(C, n, m_sub, c0, kc, Cpack);
+#if LINALG_SIMD_ENABLE
+                qrw_compute_Y_avx(A, m, n, k, ib_k, Cpack, m_sub, kc, Y);
+                qrw_compute_Z_avx(T, ib_k, Y, kc, Z);
+                qrw_apply_VZ_avx(Cpack, m_sub, kc, A, m, n, k, ib_k, Z);
+#else
+                qrw_compute_Y_scalar(A, m, n, k, ib_k, Cpack, m_sub, kc, Y);
+                qrw_compute_Z_scalar(T, ib_k, Y, kc, Z);
+                qrw_apply_VZ_scalar(Cpack, m_sub, kc, A, m, n, k, ib_k, Z);
+#endif
+                qrw_unpack_C(C, n, m_sub, c0, kc, Cpack);
+            }
+            linalg_aligned_free(Cpack);
+            linalg_aligned_free(Y);
+            linalg_aligned_free(Z);
+        }
+        linalg_aligned_free(T);
+
+        k = (uint16_t)(k + ib_k);
+    }
+
+    linalg_aligned_free(nrm);
+    linalg_aligned_free(nrm_ref);
+    linalg_aligned_free(tmp);
+    return 0;
+}
+
+/* ===========================================================================================
+ * Public entry: qr() — chooses blocked WY or scalar path; forms Q only if requested
+ * ===========================================================================================
+ */
+
 int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
        uint16_t m, uint16_t n, bool only_R)
 {
@@ -713,57 +885,33 @@ int qr(const float *RESTRICT A, float *RESTRICT Q, float *RESTRICT R,
 
     const uint16_t mn = (m < n) ? m : n;
 
-    /* Small-matrix or no-AVX fallback */
-    if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2()
-#if !LINALG_SIMD_ENABLE
-        || 1
-#endif
-    )
+    if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2())
     {
         return qr_scalar(A, Q, R, m, n, only_R);
     }
 
-    /* R ← A, Q ← I (if needed) */
-    memcpy(R, A, (size_t)m * n * sizeof(float));
-    if (!only_R)
-    {
-        memset(Q, 0, (size_t)m * m * sizeof(float));
-        for (uint16_t i = 0; i < m; ++i)
-            Q[(size_t)i * m + i] = 1.0f;
-    }
-
-#if LINALG_SIMD_ENABLE
-    /* workspace: v (len ≤ m) */
-    float *v = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m * sizeof(float));
-    if (!v)
+    memcpy(R, A, (size_t)m * n * sizeof(float)); // Factor in R
+    float *tau = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)mn * sizeof(float));
+    if (!tau)
         return -ENOMEM;
 
-    const uint16_t l = (m - 1 < n) ? (m - 1) : n;
-    for (uint16_t k = 0; k < l; ++k)
+    int rc = qrw_geqrf_blocked_wy(R, m, n, QRW_IB_DEFAULT, tau);
+    if (rc)
     {
-        float *x = R + (size_t)k * n + k; /* column segment R[k:,k] */
-        uint16_t len = (uint16_t)(m - k);
-        uint16_t nc = (uint16_t)(n - k);
+        linalg_aligned_free(tau);
+        return rc;
+    }
 
-        float tau = householder_vec_avx(v, x, len);
-        if (tau != 0.0f)
+    if (!only_R)
+    {
+        rc = qrw_orgqr_full(Q, m, R, n, tau, mn);
+        if (rc)
         {
-            apply_reflector_left_blocked_avx(x, n, v, len, tau, nc);
-
-            for (uint16_t i = k + 1; i < m; ++i)
-                R[(size_t)i * n + k] = 0.0f;
-
-            if (!only_R)
-            {
-                apply_reflector_right_Q_avx(Q, m, k, v, len, tau);
-            }
+            linalg_aligned_free(tau);
+            return rc;
         }
     }
-    linalg_aligned_free(v);
-#else
-    /* Should not reach here thanks to the guard above */
-    return qr_scalar(A, Q, R, m, n, only_R);
-#endif
 
+    linalg_aligned_free(tau);
     return 0;
 }
