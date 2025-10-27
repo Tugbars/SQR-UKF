@@ -253,6 +253,291 @@ pack_B_tile(float *RESTRICT Bp,
 
 /* ======================= Micro-kernels (AVX2/FMA) ======================= */
 
+/**
+ * @brief AVX2/FMA micro-kernel: accumulate C(4×jb) += Ap(…)*Bp(…), jb≤8.
+ *
+ * @details
+ * Same idea as the 8×8 kernel but for 4 rows. Uses aligned Bp loads,
+ * broadcast-from-A, and masked tail for jb<8. Intended for handling
+ * leftover row blocks (4..7).
+ *
+ * @param[in,out] c Pointer to C block top-left, row-major.
+ * @param[in] ldc Leading dimension of C.
+ * @param[in] Ap Packed A rows (Kblk×8, with row offset embedded by caller).
+ * @param[in] Bp Packed B panel (Kblk×8).
+ * @param[in] Kblk Shared inner dimension.
+ * @param[in] jb Active columns in this panel (1..8).
+ * @param[in] m Tail mask for jb <8.
+ */
+#if LINALG_SIMD_ENABLE
+static inline void
+gemm_4x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
+                           const float *RESTRICT Ap,
+                           const float *RESTRICT Bp,
+                           size_t Kblk, size_t jb, __m256i m /*<=8*/)
+{
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    PREFETCH_T0(c + 0 * ldc);
+    PREFETCH_T0(c + 1 * ldc);
+    PREFETCH_T0(c + 2 * ldc);
+    PREFETCH_T0(c + 3 * ldc);
+    PREFETCH_T1(c + 2 * ldc + 2 * ldc);
+    size_t k = 0;
+    for (; k + 7 < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 8;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const float *bptr = Bp + k * 8;
+        const float *aptr = Ap + k * 8;
+        for (int t = 0; t < 8; ++t)
+        {
+            const __m256 b = _mm256_load_ps(bptr);
+            acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 1), b, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 2), b, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 3), b, acc3);
+            bptr += 8;
+            aptr += 8;
+        }
+    }
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 1;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const __m256 b = _mm256_load_ps(Bp + k * 8);
+        acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 1), b, acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 2), b, acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 3), b, acc3);
+    }
+    if (jb == 8)
+    {
+        _mm256_storeu_ps(c + 0 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 0 * ldc), acc0));
+        _mm256_storeu_ps(c + 1 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 1 * ldc), acc1));
+        _mm256_storeu_ps(c + 2 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 2 * ldc), acc2));
+        _mm256_storeu_ps(c + 3 * ldc, _mm256_add_ps(_mm256_loadu_ps(c + 3 * ldc), acc3));
+    }
+    else
+    {
+#define MASKED_ADD_STORE4(ROW, ACC)                           \
+    do                                                        \
+    {                                                         \
+        __m256 oldv = _mm256_maskload_ps(c + (ROW) * ldc, m); \
+        __m256 sum = _mm256_add_ps(oldv, (ACC));              \
+        _mm256_maskstore_ps(c + (ROW) * ldc, m, sum);         \
+    } while (0)
+        MASKED_ADD_STORE4(0, acc0);
+        MASKED_ADD_STORE4(1, acc1);
+        MASKED_ADD_STORE4(2, acc2);
+        MASKED_ADD_STORE4(3, acc3);
+#undef MASKED_ADD_STORE4
+    }
+}
+#endif
+#if LINALG_SIMD_ENABLE
+static inline void
+gemm_4x8_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
+                             const float *RESTRICT Ap,
+                             const float *RESTRICT Bp,
+                             size_t Kblk, size_t jb, __m256i m /*<=8*/)
+{
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    PREFETCH_T0(c + 0 * ldc);
+    PREFETCH_T0(c + 1 * ldc);
+    PREFETCH_T0(c + 2 * ldc);
+    PREFETCH_T0(c + 3 * ldc);
+    PREFETCH_T1(c + 2 * ldc + 2 * ldc);
+    size_t k = 0;
+    for (; k + 7 < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 8;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const float *bptr = Bp + k * 8;
+        const float *aptr = Ap + k * 8;
+        for (int t = 0; t < 8; ++t)
+        {
+            const __m256 b = _mm256_load_ps(bptr);
+            acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 1), b, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 2), b, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 3), b, acc3);
+            bptr += 8;
+            aptr += 8;
+        }
+    }
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 1;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const __m256 b = _mm256_load_ps(Bp + k * 8);
+        acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 1), b, acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 2), b, acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 3), b, acc3);
+    }
+    if (jb == 8)
+    {
+        _mm256_storeu_ps(c + 0 * ldc, acc0);
+        _mm256_storeu_ps(c + 1 * ldc, acc1);
+        _mm256_storeu_ps(c + 2 * ldc, acc2);
+        _mm256_storeu_ps(c + 3 * ldc, acc3);
+    }
+    else
+    {
+#define MASKED_STORE4(ROW, ACC)                         \
+    do                                                  \
+    {                                                   \
+        _mm256_maskstore_ps(c + (ROW) * ldc, m, (ACC)); \
+    } while (0)
+        MASKED_STORE4(0, acc0);
+        MASKED_STORE4(1, acc1);
+        MASKED_STORE4(2, acc2);
+        MASKED_STORE4(3, acc3);
+#undef MASKED_STORE4
+    }
+}
+#endif
+/**
+ * @brief AVX2/FMA micro-kernel: accumulate C(1×jb) += Ap(…)*Bp(…), jb≤8.
+ *
+ * @details
+ * Single-row kernel used for residual rows. Uses aligned loads from Bp and
+ * scalar broadcast from Ap; handles jb<8 with mask load/store.
+ *
+ * @param[in,out] c Pointer to C row start.
+ * @param[in] Ap Packed A row (Kblk×8 with lane 0 used).
+ * @param[in] Bp Packed B panel (Kblk×8).
+ * @param[in] Kblk Shared inner dimension.
+ * @param[in] jb Active columns (1..8).
+ * @param[in] m Tail mask for jb <8.
+ */
+#if LINALG_SIMD_ENABLE
+static inline void
+gemm_1x8_panel_avx2fma_add(float *RESTRICT c,
+                           const float *RESTRICT Ap,
+                           const float *RESTRICT Bp,
+                           size_t Kblk, size_t jb, __m256i m /*<=8*/)
+{
+    __m256 acc = _mm256_setzero_ps();
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    PREFETCH_T0(c + 0);
+    size_t k = 0;
+    for (; k + 7 < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 8;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const float *bptr = Bp + k * 8;
+        const float *aptr = Ap + k * 8;
+        for (int t = 0; t < 8; ++t)
+        {
+            const __m256 b = _mm256_load_ps(bptr);
+            acc = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc);
+            bptr += 8;
+            aptr += 8;
+        }
+    }
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 1;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const __m256 b = _mm256_load_ps(Bp + k * 8);
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc);
+    }
+    if (jb == 8)
+    {
+        _mm256_storeu_ps(c, _mm256_add_ps(_mm256_loadu_ps(c), acc));
+    }
+    else
+    {
+        __m256 oldv = _mm256_maskload_ps(c, m);
+        __m256 sum = _mm256_add_ps(oldv, acc);
+        _mm256_maskstore_ps(c, m, sum);
+    }
+}
+#endif
+#if LINALG_SIMD_ENABLE
+static inline void
+gemm_1x8_panel_avx2fma_store(float *RESTRICT c,
+                             const float *RESTRICT Ap,
+                             const float *RESTRICT Bp,
+                             size_t Kblk, size_t jb, __m256i m /*<=8*/)
+{
+    __m256 acc = _mm256_setzero_ps();
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    PREFETCH_T0(c + 0);
+    size_t k = 0;
+    for (; k + 7 < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 8;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const float *bptr = Bp + k * 8;
+        const float *aptr = Ap + k * 8;
+        for (int t = 0; t < 8; ++t)
+        {
+            const __m256 b = _mm256_load_ps(bptr);
+            acc = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc);
+            bptr += 8;
+            aptr += 8;
+        }
+    }
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf)
+        {
+            const size_t kpf = k + 1;
+            if (kpf < Kblk)
+                PREFETCH_T0(Bp + kpf * 8);
+        }
+        const __m256 b = _mm256_load_ps(Bp + k * 8);
+        acc = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * 8 + 0), b, acc);
+    }
+    if (jb == 8)
+    {
+        _mm256_storeu_ps(c, acc);
+    }
+    else
+    {
+        _mm256_maskstore_ps(c, m, acc);
+    }
+}
+#endif
+
 #if LINALG_SIMD_ENABLE
 
 /* ---- 16x8 (add) ---- */
