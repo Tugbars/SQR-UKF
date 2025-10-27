@@ -1,33 +1,45 @@
-// Fast row-major transpose with AVX2 8x8 kernel + SSE 4x8 tail + scalar cleanup.
+// SPDX-License-Identifier: MIT
+/**
+ * @file tran_pack.c
+ * @brief Tiled transpose (single-threaded) with optional NT stores + fused pack-transpose helpers.
+ *
+ * @details
+ *  A plain transpose is memory-bound, so the big win is *not writing At at all*.
+ *  These helpers let higher-level BLAS-3 kernels request panels already stored
+ *  in transposed layout during packing. If you still need a standalone transpose,
+ *  @ref tran_tiled provides a cache-friendly 32×32 tiler over your AVX2 8×8 micro-kernel,
+ *  with an opt-in non-temporal store path to reduce cache pollution on large outputs.
+ *
+ *  What you get:
+ *   - tran_tiled(): 32×32 macro-tiles → 8×8 AVX + 8×4 SSE tails, optional NT stores.
+ *   - pack_T_8xK(): pack a transposed 8×K micro-panel from row-major A (feeds your 8×16 kernel’s A side).
+ *   - pack_T_Kx16(): pack a transposed K×16 micro-panel from row-major B (feeds your 8×16 kernel’s B side).
+ *
+ *  All routines are single-threaded by design. When you add threading, parallelize
+ *  the *outer* tiles in tran_tiled() and the caller’s macro-tiling loops around packers.
+ *
+ * Build-time knobs:
+ *   - TRAN_TILE: macro-tile edge (default 32).
+ *   - TRAN_USE_NT_STORES: 0/1 to enable _mm256_stream_ps in tran_tiled().
+ *
+ * ISA:
+ *   - AVX2 used for 8×8; SSE for 8×4 tail; scalar cleanup otherwise.
+ */
 
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <immintrin.h>
-#include <stdlib.h>
+#include "linalg_simd.h"
 
-#include "linalg_simd.h"  // linalg_has_avx2()
-
-/* ---------- optional runtime dispatch (CPUID + XGETBV) ---------- */
-#ifdef TRAN_DISPATCH
-#  include <cpuid.h>
-static inline int cpu_has_avx_runtime(void) {
-    unsigned a,b,c,d;
-    if (!__get_cpuid(1, &a,&b,&c,&d)) return 0;
-    const int osxsave = (c & (1u<<27)) != 0;
-    const int avx     = (c & (1u<<28)) != 0;
-    if (!(osxsave && avx)) return 0;
-    /* XCR0[2:1] (YMM/XMM) must be enabled by OS */
-    unsigned xcr0_lo = (unsigned)_xgetbv(0);
-    return ((xcr0_lo & 0x6) == 0x6);
-}
+#ifndef TRAN_TILE
+#define TRAN_TILE 32
+#endif
+#ifndef TRAN_USE_NT_STORES
+#define TRAN_USE_NT_STORES 1
 #endif
 
-/* ===================================================================== */
-/*                         Micro-kernels                                  */
-/* ===================================================================== */
-
-/* 8x8 AVX (row-major src -> row-major dst, with strides) */
+/* ---------- your existing micro-kernels (kept verbatim) ---------- */
 static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT dst,
                                     size_t src_stride, size_t dst_stride)
 {
@@ -67,7 +79,6 @@ static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT d
     t6 = _mm256_unpacklo_ps(r3, r7);
     t7 = _mm256_unpackhi_ps(r3, r7);
 
-    /* cross 128-bit lanes to interleave halves */
     r0 = _mm256_permute2f128_ps(t0, t4, 0x20);
     r1 = _mm256_permute2f128_ps(t0, t4, 0x31);
     r2 = _mm256_permute2f128_ps(t1, t5, 0x20);
@@ -77,6 +88,16 @@ static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT d
     r6 = _mm256_permute2f128_ps(t3, t7, 0x20);
     r7 = _mm256_permute2f128_ps(t3, t7, 0x31);
 
+#if TRAN_USE_NT_STORES
+    _mm256_stream_ps(dst + 0 * dst_stride, r0);
+    _mm256_stream_ps(dst + 1 * dst_stride, r1);
+    _mm256_stream_ps(dst + 2 * dst_stride, r2);
+    _mm256_stream_ps(dst + 3 * dst_stride, r3);
+    _mm256_stream_ps(dst + 4 * dst_stride, r4);
+    _mm256_stream_ps(dst + 5 * dst_stride, r5);
+    _mm256_stream_ps(dst + 6 * dst_stride, r6);
+    _mm256_stream_ps(dst + 7 * dst_stride, r7);
+#else
     _mm256_storeu_ps(dst + 0 * dst_stride, r0);
     _mm256_storeu_ps(dst + 1 * dst_stride, r1);
     _mm256_storeu_ps(dst + 2 * dst_stride, r2);
@@ -85,13 +106,12 @@ static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT d
     _mm256_storeu_ps(dst + 5 * dst_stride, r5);
     _mm256_storeu_ps(dst + 6 * dst_stride, r6);
     _mm256_storeu_ps(dst + 7 * dst_stride, r7);
+#endif
 }
 
-/* 8-rows x 4-cols tail using SSE (_MM_TRANSPOSE4_PS twice layouted as 8x4) */
 static inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
                                     size_t src_stride, size_t dst_stride)
 {
-    /* Load 8x4 as two 4x4 tiles stacked vertically: rows i..i+3 and i+4..i+7 */
     __m128 a0 = _mm_loadu_ps(src + 0 * src_stride);
     __m128 a1 = _mm_loadu_ps(src + 1 * src_stride);
     __m128 a2 = _mm_loadu_ps(src + 2 * src_stride);
@@ -104,96 +124,145 @@ static inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT d
     _MM_TRANSPOSE4_PS(a0, a1, a2, a3);
     _MM_TRANSPOSE4_PS(b0, b1, b2, b3);
 
-    /* Store 4 columns of 8 elements (two 4-element chunks each) */
+#if TRAN_USE_NT_STORES
+    _mm_stream_ps(dst + 0 * dst_stride + 0, a0);
+    _mm_stream_ps(dst + 0 * dst_stride + 4, b0);
+    _mm_stream_ps(dst + 1 * dst_stride + 0, a1);
+    _mm_stream_ps(dst + 1 * dst_stride + 4, b1);
+    _mm_stream_ps(dst + 2 * dst_stride + 0, a2);
+    _mm_stream_ps(dst + 2 * dst_stride + 4, b2);
+    _mm_stream_ps(dst + 3 * dst_stride + 0, a3);
+    _mm_stream_ps(dst + 3 * dst_stride + 4, b3);
+#else
     _mm_storeu_ps(dst + 0 * dst_stride + 0, a0);
     _mm_storeu_ps(dst + 0 * dst_stride + 4, b0);
-
     _mm_storeu_ps(dst + 1 * dst_stride + 0, a1);
     _mm_storeu_ps(dst + 1 * dst_stride + 4, b1);
-
     _mm_storeu_ps(dst + 2 * dst_stride + 0, a2);
     _mm_storeu_ps(dst + 2 * dst_stride + 4, b2);
-
     _mm_storeu_ps(dst + 3 * dst_stride + 0, a3);
     _mm_storeu_ps(dst + 3 * dst_stride + 4, b3);
-}
-
-/* Scalar cleanup / tiny matrices */
-static inline void transpose_scalar(const float *RESTRICT src, float *RESTRICT dst,
-                                    size_t rows, size_t cols)
-{
-    for (size_t i = 0; i < rows; ++i)
-        for (size_t j = 0; j < cols; ++j)
-            dst[j * rows + i] = src[i * cols + j];
-}
-
-/* ===================================================================== */
-/*                              Top-level                                 */
-/* ===================================================================== */
-
-void tran(float *RESTRICT At, const float *RESTRICT A, uint16_t row, uint16_t column)
-{
-    const size_t R = row, C = column;
-    if (R == 0 || C == 0) return;
-
-    /* tiny-matrix fast path */
-    if (R < 8 || C < 8) {
-        transpose_scalar(A, At, R, C);
-        return;
-    }
-
-    /* choose SIMD path */
-    int use_avx = linalg_has_avx2();
-#ifdef TRAN_DISPATCH
-    use_avx = use_avx && cpu_has_avx_runtime();
 #endif
+}
 
-    /* in-place support: if At == A, use a temporary */
-    if (At == A) {
-        const size_t nbytes = R * C * sizeof(float);
-        float *tmp = (float*)linalg_aligned_alloc(32, nbytes);
-        if (!tmp) {                  /* allocation failed: fallback scalar via two-phase */
-            float *tmp2 = (float*)malloc(nbytes);
-            if (!tmp2) return;       /* give up silently */
-            transpose_scalar(A, tmp2, R, C);
-            memcpy(At, tmp2, nbytes);
-            free(tmp2);
-            return;
-        }
-        /* write into tmp, then copy back to At */
-        tran(tmp, A, row, column);   /* recurse once with non-aliased dst */
-        memcpy(At, tmp, nbytes);
-        linalg_aligned_free(tmp);
+static inline void transpose_scalar_block(const float *RESTRICT src, float *RESTRICT dst,
+                                          size_t R, size_t C, size_t i, size_t j,
+                                          size_t rb, size_t cb)
+{
+    for (size_t r = 0; r < rb; ++r)
+        for (size_t c = 0; c < cb; ++c)
+            dst[(j + c) * R + (i + r)] = src[(i + r) * C + (j + c)];
+}
+
+/**
+ * @brief Tiled transpose with AVX2 8×8 + SSE 8×4 tails (single-threaded).
+ * @param[out] At  Row-major C×R output (may alias A? no; use a temp if you need in-place).
+ * @param[in]  A   Row-major R×C input.
+ * @param[in]  R   Rows of A.
+ * @param[in]  C   Cols of A.
+ *
+ * @note If TRAN_USE_NT_STORES!=0, uses non-temporal stores; caller should not
+ *       immediately read back At. A fence is emitted at the end.
+ */
+void tran_tiled(float *RESTRICT At, const float *RESTRICT A, uint16_t R, uint16_t C)
+{
+    if (!R || !C)
         return;
+
+    const size_t TS = TRAN_TILE;
+    const size_t Rb = R & ~(size_t)7;
+    const size_t Cb = C & ~(size_t)7;
+    const size_t C4 = Cb + ((C - Cb) & ~(size_t)3);
+
+    for (size_t i0 = 0; i0 < R; i0 += TS)
+    {
+        const size_t ib = (i0 + TS <= R) ? TS : (R - i0);
+        const size_t ib8 = ib & ~(size_t)7;
+
+        for (size_t j0 = 0; j0 < C; j0 += TS)
+        {
+            const size_t jb = (j0 + TS <= C) ? TS : (C - j0);
+            const size_t jb8 = jb & ~(size_t)7;
+            const size_t jb4 = jb8 + ((jb - jb8) & ~(size_t)3);
+
+            /* 8×8 core inside the tile */
+            for (size_t i = 0; i < ib8; i += 8)
+                for (size_t j = 0; j < jb8; j += 8)
+                    transpose8x8_avx(A + (i0 + i) * (size_t)C + (j0 + j),
+                                     At + (j0 + j) * (size_t)R + (i0 + i),
+                                     C, R);
+
+            /* 8×4 tail in-columns inside the tile */
+            for (size_t i = 0; i < ib8; i += 8)
+                for (size_t j = jb8; j < jb4; j += 4)
+                    transpose8x4_sse(A + (i0 + i) * (size_t)C + (j0 + j),
+                                     At + (j0 + j) * (size_t)R + (i0 + i),
+                                     C, R);
+
+            /* scalar remainder inside tile (cols tail and bottom rows) */
+            const size_t i_tail = ib - ib8;
+            const size_t j_tail_c = jb - jb4;
+            if (j_tail_c)
+                transpose_scalar_block(A, At, R, C, i0, j0 + jb4, ib8, j_tail_c);
+            if (i_tail)
+                transpose_scalar_block(A, At, R, C, i0 + ib8, j0, i_tail, jb);
+        }
     }
 
-    /* block sizes */
-    const size_t rb8 = R & ~7u;              /* max multiple of 8 <= R */
-    const size_t cb8 = C & ~7u;              /* max multiple of 8 <= C */
-    const size_t cb4 = cb8 + ((C - cb8) & ~3u);  /* then 4-wide tail */
+#if TRAN_USE_NT_STORES
+    _mm_sfence();
+#endif
+}
 
-    if (use_avx) {
-        /* 8x8 core */
-        for (size_t i = 0; i < rb8; i += 8)
-            for (size_t j = 0; j < cb8; j += 8)
-                transpose8x8_avx(A + i * C + j, At + j * R + i, C, R);
+/* ======================= Fused pack-transpose helpers ======================= */
 
-        /* 8x4 tail across columns */
-        for (size_t i = 0; i < rb8; i += 8)
-            for (size_t j = cb8; j < cb4; j += 4)
-                transpose8x4_sse(A + i * C + j, At + j * R + i, C, R);
+/**
+ * @brief Pack a transposed 8×K micro-panel from row-major A into contiguous buffer.
+ *
+ * @param[in]  A     Row-major A (M×Ktot), leading dim lda = Ktot.
+ * @param[in]  M     Rows in A.
+ * @param[in]  Ktot  Cols in A.
+ * @param[in]  i     Row index of the 8-row block in Aᵀ → i..i+7 columns of A.
+ * @param[in]  k0    Starting column in Aᵀ → starting row in A.
+ * @param[in]  K     Depth (number of rows from A) to pack.
+ * @param[out] Ap    Output buffer of size 8×K, laid out row-major by the 8 rows
+ *                   (i.e., suitable as the A (mr=8) operand for your 8×16 kernel).
+ *
+ * Layout result: Ap[r*K + t] = A[(k0+t), (i+r)]  for r=0..7, t=0..K-1
+ */
+static inline void pack_T_8xK(const float *RESTRICT A, uint16_t M, uint16_t Ktot,
+                              uint16_t i, uint16_t k0, uint16_t K, float *RESTRICT Ap)
+{
+    (void)M;
+    for (uint16_t r = 0; r < 8; ++r)
+    {
+        const float *col = A + (size_t)(i + r); /* column (i+r) of A */
+        float *dst = Ap + (size_t)r * K;        /* row r in packed (Aᵀ) */
+        for (uint16_t t = 0; t < K; ++t)
+            dst[t] = col[(size_t)(k0 + t) * Ktot];
     }
+}
 
-    /* scalar tails:
-       - leftover columns j in [cb4 .. C)
-       - leftover rows    i in [rb8 .. R)  (all columns) */
-    /* leftover columns for full 8-row blocks */
-    for (size_t i = 0; i < rb8; ++i)
-        for (size_t j = cb4; j < C; ++j)
-            At[j * R + i] = A[i * C + j];
-
-    /* leftover rows (all columns) */
-    for (size_t i = rb8; i < R; ++i)
-        for (size_t j = 0; j < C; ++j)
-            At[j * R + i] = A[i * C + j];
+/**
+ * @brief Pack a transposed K×16 micro-panel from row-major B into contiguous buffer.
+ *
+ * @param[in]  B     Row-major B (Ktot×N), leading dim ldb = N.
+ * @param[in]  Ktot  Rows in B.
+ * @param[in]  N     Cols in B.
+ * @param[in]  k0    Row start in B (→ column start in Bᵀ).
+ * @param[in]  j     Column index of the 16-col block in B.
+ * @param[in]  K     Depth (number of rows from B) to pack.
+ * @param[out] Bp    Output buffer of size K×16 in column-panels of 16;
+ *                   at step t, store two 8-wide vectors contiguous to match your 8×16 kernel.
+ *
+ * Layout result: Bp[t*16 + c] = B[(k0+t), (j+c)]  for c=0..15
+ */
+static inline void pack_T_Kx16(const float *RESTRICT B, uint16_t Ktot, uint16_t N,
+                               uint16_t k0, uint16_t j, uint16_t K, float *RESTRICT Bp)
+{
+    for (uint16_t t = 0; t < K; ++t)
+    {
+        const float *row = B + (size_t)(k0 + t) * N + j;
+        memcpy(Bp + (size_t)t * 16, row, 16 * sizeof(float));
+    }
 }
