@@ -38,21 +38,31 @@
 #define PREFETCH_T1(ptr) ((void)0)
 #endif
 /* ===== helper: AVX2 mask for N-tail (jb < 8) ===== */
-#if LINALG_SIMD_ENABLE
-static inline __m256i avx2_tailmask(int jb)
-{
-    /* lanes in ascending address order (setr) */
-    return _mm256_setr_epi32(
-        (jb > 0) ? -1 : 0,
-        (jb > 1) ? -1 : 0,
-        (jb > 2) ? -1 : 0,
-        (jb > 3) ? -1 : 0,
-        (jb > 4) ? -1 : 0,
-        (jb > 5) ? -1 : 0,
-        (jb > 6) ? -1 : 0,
-        (jb > 7) ? -1 : 0);
+// Table for 0..8 lanes (-1 = load/store lane; 0 = masked)
+static const alignas(64) int8_t kMask8x8[9][8] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0},
+    {-1, 0, 0, 0, 0, 0, 0, 0},
+    {-1,-1, 0, 0, 0, 0, 0, 0},
+    {-1,-1,-1, 0, 0, 0, 0, 0},
+    {-1,-1,-1,-1, 0, 0, 0, 0},
+    {-1,-1,-1,-1,-1, 0, 0, 0},
+    {-1,-1,-1,-1,-1,-1, 0, 0},
+    {-1,-1,-1,-1,-1,-1,-1, 0},
+    {-1,-1,-1,-1,-1,-1,-1,-1}
+};
+
+static inline __m256i avx2_tailmask_fast(int lanes /*0..8*/) {
+    __m128i b8 = _mm_loadl_epi64((const __m128i*)kMask8x8[lanes]);
+    return _mm256_cvtepi8_epi32(b8);
 }
-#endif
+
+// n = active columns (≤ NR), NR ∈ {6,8}
+static inline __m256i avx2_tailmask_nr(size_t n, size_t NR)
+{
+    size_t lanes = (n <= NR) ? n : NR;
+    return avx2_tailmask_fast((int)lanes);
+}
+
 /* ======================= Packing ======================= */
 /**
  * @brief Pack an A tile into 8-row–striped layout for AVX2 micro-kernels.
@@ -869,44 +879,68 @@ gemm_1x8_panel_avx2fma_store(float *RESTRICT c,
 
 /* ===== helper: AVX2 mask for N-tail (jb < 8) ===== */
 #if LINALG_SIMD_ENABLE
-    static const alignas(64) int8_t kMask8x8[9][8] = {
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        {-1, 0, 0, 0, 0, 0, 0, 0},
-        {-1, -1, 0, 0, 0, 0, 0, 0},
-        {-1, -1, -1, 0, 0, 0, 0, 0},
-        {-1, -1, -1, -1, 0, 0, 0, 0},
-        {-1, -1, -1, -1, -1, 0, 0, 0},
-        {-1, -1, -1, -1, -1, -1, 0, 0},
-        {-1, -1, -1, -1, -1, -1, -1, 0},
-        {-1, -1, -1, -1, -1, -1, -1, -1}};
+static const alignas(64) int8_t kMask8x8[9][8] = {
+    {0, 0, 0, 0, 0, 0, 0, 0},
+    {-1, 0, 0, 0, 0, 0, 0, 0},
+    {-1, -1, 0, 0, 0, 0, 0, 0},
+    {-1, -1, -1, 0, 0, 0, 0, 0},
+    {-1, -1, -1, -1, 0, 0, 0, 0},
+    {-1, -1, -1, -1, -1, 0, 0, 0},
+    {-1, -1, -1, -1, -1, -1, 0, 0},
+    {-1, -1, -1, -1, -1, -1, -1, 0},
+    {-1, -1, -1, -1, -1, -1, -1, -1}};
+
 static inline __m256i avx2_tailmask_fast(int jb)
 {
     __m128i b8 = _mm_loadl_epi64((const __m128i *)kMask8x8[jb]);
     return _mm256_cvtepi8_epi32(b8);
 }
 #endif
+
+/* Updated enum with new shapes */
 enum kernel_shape
 {
     K16x6,
-    K8x6
+    K8x6,
+    K16x8,
+    K8x8
 };
+
 static inline enum kernel_shape pick_kernel(size_t Mblk, size_t Nblk, size_t Kblk)
 {
-    if (Nblk <= 6)
+    if (Nblk >= 8 && (Nblk % 8 >= 6 || Nblk >= 3 * (size_t)LINALG_SMALL_N_THRESH))
     {
-        if (Kblk <= 128)
-            return K8x6;
+        // prefer 8-wide if tails are small-ish or N is very wide
+        if (Mblk >= 16 && Kblk >= 96)
+            return K16x8;
+        if (Mblk >= 8)
+            return K8x8;
+    }
+    // else 6-wide
+    if (Mblk >= 16)
         return K16x6;
-    }
-    if (Nblk <= 12)
-    {
-        return (Mblk >= 16) ? K16x6 : K8x6;
-    }
-    return K16x6;
+    return K8x6;
 }
 
-
 /* ======================= Packing ======================= */
+static inline void
+pack_B_tile(float *RESTRICT Bp,
+            const float *RESTRICT B,
+            size_t K, size_t N,
+            size_t kk, size_t Kblk,
+            size_t j0, size_t jb,
+            size_t NR)
+{
+    if (NR == 8)
+    {
+        pack_B_8col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
+    }
+    else
+    { // assume 6
+        pack_B_6col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
+    }
+}
+
 /**
  * @brief Pack an A tile into column-major layout for 16-row AVX2 micro-kernels.
  *
@@ -1100,6 +1134,290 @@ pack_A_16row_tile(float *RESTRICT Ap,
     }
 }
 /* ======================= Micro-kernels (AVX2/FMA) ======================= */
+#if LINALG_SIMD_ENABLE
+/* New: 16x8 kernel (add variant), adapted from 16x6 with NR=8 and masking */
+static inline void
+gemm_16x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
+                            const float *RESTRICT Ap,
+                            const float *RESTRICT Bp,
+                            size_t Kblk, size_t m, size_t n, __m256i mask /* for n<8 */)
+{
+    __m256 acc_lo[8] = {};
+    __m256 acc_hi[8] = {};
+    for (int j = 0; j < 8; ++j)
+    {
+        acc_lo[j] = _mm256_setzero_ps();
+        acc_hi[j] = _mm256_setzero_ps();
+    }
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    /* prefetch C rows */
+    for (size_t r = 0; r < m; r += 4)
+    {
+        PREFETCH_T0(c + r * ldc);
+    }
+    const size_t PF_LONG = 32; // tunable, perhaps higher for NR=8
+    for (size_t k = 0; k < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            size_t kpf_s = k + 8;
+            size_t kpf_l = k + PF_LONG;
+            if (kpf_s < Kblk)
+                PREFETCH_T0(Bp + kpf_s * 8);
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Bp + kpf_l * 8);
+#if LINALG_GEMM_PREFETCH_A_LONG
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Ap + kpf_l * 16);
+#endif
+        }
+        for (int u = 0; u < 8; ++u)
+        {
+            size_t kk = k + u;
+            if (kk >= Kblk)
+                break;
+            __m256 a_lo = _mm256_load_ps(Ap + kk * 16);
+            __m256 a_hi = _mm256_load_ps(Ap + kk * 16 + 8);
+            const float *b_row = Bp + kk * 8;
+            for (int j = 0; j < 8; ++j)
+            {
+                __m256 bcast = _mm256_broadcast_ss(b_row + j);
+                acc_lo[j] = _mm256_fmadd_ps(a_lo, bcast, acc_lo[j]);
+                acc_hi[j] = _mm256_fmadd_ps(a_hi, bcast, acc_hi[j]);
+            }
+        }
+    }
+    /* temp buffer for col-major store */
+    alignas(32) float temp[16 * 8];
+    for (int j = 0; j < 8; ++j)
+    {
+        _mm256_store_ps(temp + j * 16, acc_lo[j]);
+        _mm256_store_ps(temp + j * 16 + 8, acc_hi[j]);
+    }
+    /* add to C row-major, with mask for n<8 */
+    for (size_t r = 0; r < m; ++r)
+    {
+        float *cr = c + r * ldc;
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
+        {
+            ((float *)&sum)[jj] = temp[jj * 16 + r];
+        }
+        __m256 old = _mm256_maskload_ps(cr, mask);
+        sum = _mm256_add_ps(old, sum);
+        _mm256_maskstore_ps(cr, mask, sum);
+    }
+}
+#endif
+
+#if LINALG_SIMD_ENABLE
+/* New: 16x8 kernel (store variant) */
+static inline void
+gemm_16x8_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
+                              const float *RESTRICT Ap,
+                              const float *RESTRICT Bp,
+                              size_t Kblk, size_t m, size_t n, __m256i mask)
+{
+    __m256 acc_lo[8];
+    __m256 acc_hi[8];
+    for (int j = 0; j < 8; ++j)
+    {
+        acc_lo[j] = _mm256_setzero_ps();
+        acc_hi[j] = _mm256_setzero_ps();
+    }
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    /* prefetch C rows */
+    for (size_t r = 0; r < m; r += 4)
+    {
+        PREFETCH_T0(c + r * ldc);
+    }
+    const size_t PF_LONG = 32; // tunable, perhaps higher for NR=8
+    for (size_t k = 0; k < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            size_t kpf_s = k + 8;
+            size_t kpf_l = k + PF_LONG;
+            if (kpf_s < Kblk)
+                PREFETCH_T0(Bp + kpf_s * 8);
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Bp + kpf_l * 8);
+#if LINALG_GEMM_PREFETCH_A_LONG
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Ap + kpf_l * 16);
+#endif
+        }
+        for (int u = 0; u < 8; ++u)
+        {
+            size_t kk = k + u;
+            if (kk >= Kblk)
+                break;
+            __m256 a_lo = _mm256_load_ps(Ap + kk * 16);
+            __m256 a_hi = _mm256_load_ps(Ap + kk * 16 + 8);
+            const float *b_row = Bp + kk * 8;
+            for (int j = 0; j < 8; ++j)
+            {
+                __m256 bcast = _mm256_broadcast_ss(b_row + j);
+                acc_lo[j] = _mm256_fmadd_ps(a_lo, bcast, acc_lo[j]);
+                acc_hi[j] = _mm256_fmadd_ps(a_hi, bcast, acc_hi[j]);
+            }
+        }
+    }
+    /* temp buffer for col-major store */
+    alignas(32) float temp[16 * 8];
+    for (int j = 0; j < 8; ++j)
+    {
+        _mm256_store_ps(temp + j * 16, acc_lo[j]);
+        _mm256_store_ps(temp + j * 16 + 8, acc_hi[j]);
+    }
+    for (size_t r = 0; r < m; ++r)
+    {
+        float *cr = c + r * ldc;
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
+        {
+            ((float *)&sum)[jj] = temp[jj * 16 + r];
+        }
+        _mm256_maskstore_ps(cr, mask, sum);
+    }
+}
+#endif
+
+#if LINALG_SIMD_ENABLE
+/* New: 8x8 kernel (add), adapted from 8x6 with NR=8 and masking */
+static inline void
+gemm_8x8_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
+                           const float *RESTRICT Ap,
+                           const float *RESTRICT Bp,
+                           size_t Kblk, size_t m, size_t n, __m256i mask)
+{
+    __m256 acc[8] = {};
+    for (int j = 0; j < 8; ++j)
+    {
+        acc[j] = _mm256_setzero_ps();
+    }
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    for (size_t r = 0; r < m; r += 4)
+    {
+        PREFETCH_T0(c + r * ldc);
+    }
+    const size_t PF_LONG = 32;
+    for (size_t k = 0; k < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            size_t kpf_s = k + 8;
+            size_t kpf_l = k + PF_LONG;
+            if (kpf_s < Kblk)
+                PREFETCH_T0(Bp + kpf_s * 8);
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Bp + kpf_l * 8);
+#if LINALG_GEMM_PREFETCH_A_LONG
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Ap + kpf_l * 8);
+#endif
+        }
+        for (int u = 0; u < 8; ++u)
+        {
+            size_t kk = k + u;
+            if (kk >= Kblk)
+                break;
+            __m256 a = _mm256_load_ps(Ap + kk * 8);
+            const float *b_row = Bp + kk * 8;
+            for (int j = 0; j < 8; ++j)
+            {
+                __m256 bcast = _mm256_broadcast_ss(b_row + j);
+                acc[j] = _mm256_fmadd_ps(a, bcast, acc[j]);
+            }
+        }
+    }
+    alignas(32) float temp[8 * 8];
+    for (int j = 0; j < 8; ++j)
+    {
+        _mm256_store_ps(temp + j * 8, acc[j]);
+    }
+    for (size_t r = 0; r < m; ++r)
+    {
+        float *cr = c + r * ldc;
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
+        {
+            ((float *)&sum)[jj] = temp[jj * 8 + r];
+        }
+        __m256 old = _mm256_maskload_ps(cr, mask);
+        sum = _mm256_add_ps(old, sum);
+        _mm256_maskstore_ps(cr, mask, sum);
+    }
+}
+#endif
+
+#if LINALG_SIMD_ENABLE
+/* New: 8x8 kernel (store) */
+static inline void
+gemm_8x8_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
+                             const float *RESTRICT Ap,
+                             const float *RESTRICT Bp,
+                             size_t Kblk, size_t m, size_t n, __m256i mask)
+{
+    __m256 acc[8];
+    for (int j = 0; j < 8; ++j)
+    {
+        acc[j] = _mm256_setzero_ps();
+    }
+    const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    /* prefetch C rows */
+    for (size_t r = 0; r < m; r += 4)
+    {
+        PREFETCH_T0(c + r * ldc);
+    }
+    const size_t PF_LONG = 32; // tunable, perhaps higher for NR=8
+    for (size_t k = 0; k < Kblk; k += 8)
+    {
+        if (do_pf)
+        {
+            size_t kpf_s = k + 8;
+            size_t kpf_l = k + PF_LONG;
+            if (kpf_s < Kblk)
+                PREFETCH_T0(Bp + kpf_s * 8);
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Bp + kpf_l * 8);
+#if LINALG_GEMM_PREFETCH_A_LONG
+            if (kpf_l < Kblk)
+                PREFETCH_T0(Ap + kpf_l * 8);
+#endif
+        }
+        for (int u = 0; u < 8; ++u)
+        {
+            size_t kk = k + u;
+            if (kk >= Kblk)
+                break;
+            __m256 a = _mm256_load_ps(Ap + kk * 8);
+            const float *b_row = Bp + kk * 8;
+            for (int j = 0; j < 8; ++j)
+            {
+                __m256 bcast = _mm256_broadcast_ss(b_row + j);
+                acc[j] = _mm256_fmadd_ps(a, bcast, acc[j]);
+            }
+        }
+    }
+    alignas(32) float temp[8 * 8];
+    for (int j = 0; j < 8; ++j)
+    {
+        _mm256_store_ps(temp + j * 8, acc[j]);
+    }
+    for (size_t r = 0; r < m; ++r)
+    {
+        float *cr = c + r * ldc;
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
+        {
+            ((float *)&sum)[jj] = temp[jj * 8 + r];
+        }
+        _mm256_maskstore_ps(cr, mask, sum);
+    }
+}
+#endif
+
 /**
  * @brief AVX2/FMA micro-kernel: accumulate C(16×6) += Ap(…)*Bp(…), with tails.
  *
@@ -1117,11 +1435,12 @@ pack_A_16row_tile(float *RESTRICT Ap,
  * @param[in] n Active columns (1..6).
  */
 #if LINALG_SIMD_ENABLE
+/* Refactored: Update 16x6 to use mask instead of special n==6 path */
 static inline void
 gemm_16x6_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
                             const float *RESTRICT Ap,
                             const float *RESTRICT Bp,
-                            size_t Kblk, size_t m, size_t n)
+                            size_t Kblk, size_t m, size_t n, __m256i mask /* new: for n<6 */)
 {
     __m256 acc_lo[6];
     __m256 acc_hi[6];
@@ -1141,8 +1460,8 @@ gemm_16x6_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     {
         if (do_pf)
         {
-            size_t kpf_s = k + 8;       // short lookahead
-            size_t kpf_l = k + PF_LONG; // long lookahead
+            size_t kpf_s = k + 8;
+            size_t kpf_l = k + PF_LONG;
             if (kpf_s < Kblk)
                 PREFETCH_T0(Bp + kpf_s * 6);
             if (kpf_l < Kblk)
@@ -1168,40 +1487,33 @@ gemm_16x6_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
             }
         }
     }
-    /* temp buffer for col-major store */
     alignas(32) float temp[16 * 6];
     for (int j = 0; j < 6; ++j)
     {
         _mm256_store_ps(temp + j * 16, acc_lo[j]);
         _mm256_store_ps(temp + j * 16 + 8, acc_hi[j]);
     }
-    /* add to C row-major, vectorized for n=6 */
     for (size_t r = 0; r < m; ++r)
     {
         float *cr = c + r * ldc;
-        if (n == 6)
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
         {
-            __m256 sum = _mm256_set_ps(0, 0, temp[5 * 16 + r], temp[4 * 16 + r], temp[3 * 16 + r], temp[2 * 16 + r], temp[1 * 16 + r], temp[0 * 16 + r]);
-            __m256 old = _mm256_loadu_ps(cr);
-            sum = _mm256_add_ps(old, sum);
-            _mm256_storeu_ps(cr, sum);
+            ((float *)&sum)[jj] = temp[jj * 16 + r];
         }
-        else
-        {
-            for (size_t jj = 0; jj < n; ++jj)
-            {
-                cr[jj] += temp[jj * 16 + r];
-            }
-        }
+        __m256 old = _mm256_maskload_ps(cr, mask);
+        sum = _mm256_add_ps(old, sum);
+        _mm256_maskstore_ps(cr, mask, sum);
     }
 }
 #endif
+
 #if LINALG_SIMD_ENABLE
 static inline void
 gemm_16x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
                               const float *RESTRICT Ap,
                               const float *RESTRICT Bp,
-                              size_t Kblk, size_t m, size_t n)
+                              size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     __m256 acc_lo[6];
     __m256 acc_hi[6];
@@ -1269,12 +1581,14 @@ gemm_16x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
     }
 }
 #endif
+
 #if LINALG_SIMD_ENABLE
+/* Refactored: 8x6 add with mask */
 static inline void
 gemm_8x6_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
                            const float *RESTRICT Ap,
                            const float *RESTRICT Bp,
-                           size_t Kblk, size_t m, size_t n)
+                           size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -1333,33 +1647,28 @@ gemm_8x6_panel_avx2fma_add(float *RESTRICT c, size_t ldc,
     _mm256_store_ps(temp + 3 * 8, acc3);
     _mm256_store_ps(temp + 4 * 8, acc4);
     _mm256_store_ps(temp + 5 * 8, acc5);
-    /* add to C row-major, vectorized for n=6 */
     for (size_t r = 0; r < m; ++r)
     {
         float *cr = c + r * ldc;
-        if (n == 6)
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
         {
-            __m256 sum = _mm256_set_ps(0, 0, temp[5 * 8 + r], temp[4 * 8 + r], temp[3 * 8 + r], temp[2 * 8 + r], temp[1 * 8 + r], temp[0 * 8 + r]);
-            __m256 old = _mm256_loadu_ps(cr);
-            sum = _mm256_add_ps(old, sum);
-            _mm256_storeu_ps(cr, sum);
+            ((float *)&sum)[jj] = temp[jj * 8 + r];
         }
-        else
-        {
-            for (size_t jj = 0; jj < n; ++jj)
-            {
-                cr[jj] += temp[jj * 8 + r];
-            }
-        }
+        __m256 old = _mm256_maskload_ps(cr, mask);
+        sum = _mm256_add_ps(old, sum);
+        _mm256_maskstore_ps(cr, mask, sum);
     }
 }
 #endif
+
 #if LINALG_SIMD_ENABLE
+/* Refactored: 8x6 store with mask */
 static inline void
 gemm_8x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
                              const float *RESTRICT Ap,
                              const float *RESTRICT Bp,
-                             size_t Kblk, size_t m, size_t n)
+                             size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -1368,6 +1677,11 @@ gemm_8x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
     __m256 acc4 = _mm256_setzero_ps();
     __m256 acc5 = _mm256_setzero_ps();
     const int do_pf = (int)(Kblk >= (size_t)LINALG_GEMM_PF_MIN_K);
+    /* prefetch C rows */
+    for (size_t r = 0; r < m; r += 4)
+    {
+        PREFETCH_T0(c + r * ldc);
+    }
     const size_t PF_LONG = 32;
     for (size_t k = 0; k < Kblk; k += 8)
     {
@@ -1413,25 +1727,19 @@ gemm_8x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
     _mm256_store_ps(temp + 3 * 8, acc3);
     _mm256_store_ps(temp + 4 * 8, acc4);
     _mm256_store_ps(temp + 5 * 8, acc5);
-    /* store to C row-major, vectorized for n=6 */
     for (size_t r = 0; r < m; ++r)
     {
         float *cr = c + r * ldc;
-        if (n == 6)
+        __m256 sum = _mm256_setzero_ps();
+        for (size_t jj = 0; jj < n; ++jj)
         {
-            __m256 sum = _mm256_set_ps(0, 0, temp[5 * 8 + r], temp[4 * 8 + r], temp[3 * 8 + r], temp[2 * 8 + r], temp[1 * 8 + r], temp[0 * 8 + r]);
-            _mm256_storeu_ps(cr, sum);
+            ((float *)&sum)[jj] = temp[jj * 8 + r];
         }
-        else
-        {
-            for (size_t jj = 0; jj < n; ++jj)
-            {
-                cr[jj] = temp[jj * 8 + r];
-            }
-        }
+        _mm256_maskstore_ps(cr, mask, sum);
     }
 }
 #endif
+
 /* ======================= Top-level GEMM ======================= */
 /**
  * @brief GEMM-lite: compute C = A * B (row-major), AVX2/FMA-optimized.
@@ -1463,6 +1771,7 @@ gemm_8x6_panel_avx2fma_store(float *RESTRICT c, size_t ldc,
  * @note Tuning knobs: LINALG_BLOCK_{KC,JC,MC}, LINALG_SMALL_N_THRESH,
  * LINALG_GEMM_PF_* and LINALG_GEMM_PREFETCH_ENABLE.
  */
+/* Refactored main mul function with vtable, dynamic NR, etc. */
 int mul(float *RESTRICT C,
         const float *RESTRICT A,
         const float *RESTRICT B,
@@ -1493,8 +1802,35 @@ int mul(float *RESTRICT C,
     const size_t Kc = (size_t)LINALG_BLOCK_KC;
     const size_t Nc = (size_t)LINALG_BLOCK_JC;
     const size_t Mc = (size_t)LINALG_BLOCK_MC;
-    const size_t max_n_panels = (Nc + 5) / 6;
-    const size_t max_Bp_elems = Kc * max_n_panels * 6;
+    // Vtable
+    struct ker
+    {
+        void (*packA_blk)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t);
+        void (*packA_tail)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t);
+        void (*gemm_add)(float *, size_t, const float *, const float *, size_t, size_t, size_t, __m256i);
+        void (*gemm_store)(float *, size_t, const float *, const float *, size_t, size_t, size_t, __m256i);
+        size_t MR, NR, A_ld;
+    };
+    static const struct ker KERS[4] = {
+        {// K16x6
+         pack_A_block_16row_colmajor, pack_A_16row_tile,
+         gemm_16x6_panel_avx2fma_add, gemm_16x6_panel_avx2fma_store,
+         16, 6, 16},
+        {// K8x6
+         pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
+         gemm_8x6_panel_avx2fma_add, gemm_8x6_panel_avx2fma_store,
+         8, 6, 8},
+        {// K16x8
+         pack_A_block_16row_colmajor, pack_A_16row_tile,
+         gemm_16x8_panel_avx2fma_add, gemm_16x8_panel_avx2fma_store,
+         16, 8, 16},
+        {// K8x8
+         pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
+         gemm_8x8_panel_avx2fma_add, gemm_8x8_panel_avx2fma_store,
+         8, 8, 8}};
+    const size_t max_nr = 8; // for buffer calc
+    const size_t max_n_panels = (Nc + max_nr - 1) / max_nr;
+    const size_t max_Bp_elems = Kc * max_n_panels * max_nr;
     float *Bp = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, max_Bp_elems * sizeof(float));
     if (!Bp)
         return -ENOMEM;
@@ -1508,7 +1844,6 @@ int mul(float *RESTRICT C,
     for (size_t j0 = 0; j0 < N; j0 += Nc)
     {
         const size_t jb_tile = (j0 + Nc <= N) ? Nc : (N - j0);
-        const size_t n_panels_tile = (jb_tile + 5) / 6;
         for (size_t kk = 0; kk < K; kk += Kc)
         {
             const size_t Kblk = (kk + Kc <= K) ? Kc : (K - kk);
@@ -1522,12 +1857,16 @@ int mul(float *RESTRICT C,
                     PREFETCH_T1(B + kk_next * N + jpf);
                 }
             }
-            /* pack B for all panels of this (j0, kk) */
+            enum kernel_shape shape = pick_kernel(Mc, jb_tile, Kblk); // Mc for Mblk approx
+            const struct ker *ker = &KERS[shape];
+            const size_t NR = ker->NR;
+            const size_t n_panels_tile = (jb_tile + NR - 1) / NR;
+            // pack B for this shape
             size_t panel_off = 0;
-            for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 6, panel_off += Kblk * 6)
+            for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += NR, panel_off += Kblk * NR)
             {
-                const size_t n_block = (j + 6 <= j0 + jb_tile) ? 6 : (j0 + jb_tile - j);
-                pack_B_6col_tile(Bp + panel_off, B, K, N, kk, Kblk, j, n_block);
+                const size_t n_block = (j + NR <= j0 + jb_tile) ? NR : (j0 + jb_tile - j);
+                pack_B_tile(Bp + panel_off, B, K, N, kk, Kblk, j, n_block, NR);
             }
             for (size_t i0 = 0; i0 < M; i0 += Mc)
             {
@@ -1540,70 +1879,49 @@ int mul(float *RESTRICT C,
                         PREFETCH_T1(A + ipf * K + kk);
                     }
                 }
-                enum kernel_shape shape = pick_kernel(ib_tile, jb_tile, Kblk);
-                /* compute using selected kernel with tails */
                 size_t i = 0;
-                size_t mr = (shape == K16x6) ? 16 : 8;
-                size_t Ap_ld = (shape == K16x6) ? 16 : 8;
-                void (*pack_A_block)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t) = (shape == K16x6) ? pack_A_block_16row_colmajor : pack_A_block_8row_colmajor;
-                void (*pack_A_tile)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t) = (shape == K16x6) ? pack_A_16row_tile : pack_A_block_8row_colmajor; // reuse for 8x6 leftovers
-                void (*gemm_add)(float *, size_t, const float *, const float *, size_t, size_t, size_t) = (shape == K16x6) ? gemm_16x6_panel_avx2fma_add : gemm_8x6_panel_avx2fma_add;
-                void (*gemm_store)(float *, size_t, const float *, const float *, size_t, size_t, size_t) = (shape == K16x6) ? gemm_16x6_panel_avx2fma_store : gemm_8x6_panel_avx2fma_store;
+                size_t mr = ker->MR;
                 for (; i + mr - 1 < ib_tile; i += mr)
                 {
-                    pack_A_block(Ap, A, M, K, i0 + i, mr, kk, Kblk);
+                    ker->packA_blk(Ap, A, M, K, i0 + i, mr, kk, Kblk);
                     size_t panel_off = 0;
-                    for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 6, panel_off += Kblk * 6)
+                    for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += NR, panel_off += Kblk * NR)
                     {
-                        const size_t n_block = (j + 6 <= j0 + jb_tile) ? 6 : (j0 + jb_tile - j);
+                        const size_t n_block = (j + NR <= j0 + jb_tile) ? NR : (j0 + jb_tile - j);
+                        __m256i mask = avx2_tailmask_nr(n_block, NR);
                         if (kk == 0)
                         {
-                            gemm_store(
-                                C + (i0 + i) * N + j, N,
-                                Ap,
-                                Bp + panel_off,
-                                Kblk, mr, n_block);
+                            ker->gemm_store(C + (i0 + i) * N + j, N, Ap, Bp + panel_off, Kblk, mr, n_block, mask);
                         }
                         else
                         {
-                            gemm_add(
-                                C + (i0 + i) * N + j, N,
-                                Ap,
-                                Bp + panel_off,
-                                Kblk, mr, n_block);
+                            ker->gemm_add(C + (i0 + i) * N + j, N, Ap, Bp + panel_off, Kblk, mr, n_block, mask);
                         }
                     }
                 }
-                /* leftover <mr rows */
+                // leftover rows
                 if (i < ib_tile)
                 {
                     const size_t m_block = ib_tile - i;
-                    pack_A_tile(Ap, A, M, K, i0 + i, m_block, kk, Kblk);
+                    ker->packA_tail(Ap, A, M, K, i0 + i, m_block, kk, Kblk);
                     size_t panel_off = 0;
-                    for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += 6, panel_off += Kblk * 6)
+                    for (size_t p = 0, j = j0; p < n_panels_tile; ++p, j += NR, panel_off += Kblk * NR)
                     {
-                        const size_t n_block = (j + 6 <= j0 + jb_tile) ? 6 : (j0 + jb_tile - j);
+                        const size_t n_block = (j + NR <= j0 + jb_tile) ? NR : (j0 + jb_tile - j);
+                        __m256i mask = avx2_tailmask_nr(n_block, NR);
                         if (kk == 0)
                         {
-                            gemm_store(
-                                C + (i0 + i) * N + j, N,
-                                Ap,
-                                Bp + panel_off,
-                                Kblk, m_block, n_block);
+                            ker->gemm_store(C + (i0 + i) * N + j, N, Ap, Bp + panel_off, Kblk, m_block, n_block, mask);
                         }
                         else
                         {
-                            gemm_add(
-                                C + (i0 + i) * N + j, N,
-                                Ap,
-                                Bp + panel_off,
-                                Kblk, m_block, n_block);
+                            ker->gemm_add(C + (i0 + i) * N + j, N, Ap, Bp + panel_off, Kblk, m_block, n_block, mask);
                         }
                     }
                 }
-            } /* i0 over Mc */
-        } /* kk over Kc */
-    } /* j0 over Nc */
+            }
+        }
+    }
     linalg_aligned_free(Ap);
     linalg_aligned_free(Bp);
     return 0;
